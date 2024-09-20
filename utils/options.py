@@ -67,6 +67,7 @@ def parse(opt_path, root_path, is_train=True):
         opt['path']['experiments_root'] = experiments_root
         opt['path']['models'] = osp.join(experiments_root, 'models')
         opt['path']['log'] = osp.join(experiments_root, 'log')
+        opt['path']['visualization'] = osp.join(experiments_root, 'visualization')
     else:  # specify test log paths
         results_root = osp.join(root_path, 'results', opt['name'])
         opt['path']['results_root'] = results_root

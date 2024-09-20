@@ -5,3 +5,5 @@ potpourri3d
 open3d
 h5py
 tensorboard
+pandas
+rtree

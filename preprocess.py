@@ -1,4 +1,4 @@
-import os
+import os, csv
 import scipy.io as sio
 import numpy as np
 from argparse import ArgumentParser
@@ -17,7 +17,6 @@ if __name__ == '__main__':
     parser.add_argument('--data_root', required=True, help='data root contains /off sub-folder.')
     parser.add_argument('--n_eig', type=int, default=300, help='number of eigenvectors/values to compute.')
     parser.add_argument('--no_eig', action='store_true', help='no laplacian eigen-decomposition')
-    parser.add_argument('--no_dist', action='store_true', help='no geodesic matrix.')
     parser.add_argument('--no_normalize', action='store_true', help='no normalization of face area.')
     args = parser.parse_args()
 
@@ -25,7 +24,6 @@ if __name__ == '__main__':
     data_root = args.data_root
     n_eig = args.n_eig
     no_eig = args.no_eig
-    no_dist = args.no_dist
     no_normalize = args.no_normalize
     assert n_eig > 0, f'Invalid n_eig: {n_eig}'
     assert os.path.isdir(data_root), f'Invalid data root: {data_root}'
@@ -34,37 +32,39 @@ if __name__ == '__main__':
         spectral_dir = os.path.join(data_root, 'diffusion')
         os.makedirs(spectral_dir, exist_ok=True)
 
-    if not no_dist:
-        dist_dir = os.path.join(data_root, 'dist')
-        os.makedirs(dist_dir, exist_ok=True)
-
     # read .off files
     off_files = sorted(glob(os.path.join(data_root, 'off', '*.off')))
     assert len(off_files) != 0
 
-    for off_file in tqdm(off_files):
-        verts, faces = read_shape(off_file)
-        filename = os.path.basename(off_file)
+    # read mesh info file
+    header = ['file_name', 'mean_x', 'mean_y', 'mean_z', 'face_area']
+    with open(os.path.join(data_root, 'mesh_info.csv'), 'w+', encoding='UTF8') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
 
-        if not no_normalize:
-            # center shape
-            verts -= np.mean(verts, axis=0)
+        for off_file in tqdm(off_files):
+            verts, faces = read_shape(off_file)
+            filename = os.path.basename(off_file)
 
-            # normalize verts by sqrt face area
-            old_sqrt_area = laplacian_decomposition(verts=verts, faces=faces, k=1)[-1]
-            print(f'Old face sqrt area: {old_sqrt_area:.3f}')
-            verts /= old_sqrt_area
+            if not no_normalize:
+                # center shape
+                verts_mean = np.mean(verts, axis=0)
+                verts -= verts_mean
 
-            # save new verts and faces
-            write_off(off_file, verts, faces)
+                # normalize verts by sqrt face area
+                old_sqrt_area = laplacian_decomposition(verts=verts, faces=faces, k=1)[-1]
+                print(f'Old face sqrt area: {old_sqrt_area:.3f}')
+                verts /= old_sqrt_area
 
-        if not no_eig:
-            # recompute laplacian decomposition
-            get_operators(torch.from_numpy(verts).float(), torch.from_numpy(faces).long(),
-                          k=n_eig, cache_dir=spectral_dir)
+                # save new verts and faces
+                write_off(off_file, verts, faces)
 
-        if not no_dist:
-            # compute distance matrix
-            dist_mat = compute_geodesic_distmat(verts, faces)
-            # save results
-            sio.savemat(os.path.join(dist_dir, filename.replace('.off', '.mat')), {'dist': dist_mat})
+                # write mesh info
+                data = [filename[:-4], verts_mean[0], verts_mean[1], verts_mean[2],
+                        old_sqrt_area]
+                writer.writerow(data)
+
+            if not no_eig:
+                # recompute laplacian decomposition
+                get_operators(torch.from_numpy(verts).float(), torch.from_numpy(faces).long(),
+                              k=n_eig, cache_dir=spectral_dir)

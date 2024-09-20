@@ -2,10 +2,10 @@ import os
 import time
 import shutil
 import numpy as np
-import matplotlib.pyplot as plt
 import scipy.io as sio
 from copy import deepcopy
 from tqdm import tqdm
+import pandas as pd
 from collections import OrderedDict
 
 import torch
@@ -22,6 +22,9 @@ from utils.dist_util import master_only
 from utils.logger import AvgTimer
 from utils.texture_util import write_obj_pair, write_point_cloud_pair
 from utils.tensor_util import to_numpy
+from utils.shape_util import read_shape
+from datasets.shape_dataset import get_spectral_ops
+from models.pca_model import SSMPCA
 
 
 class BaseModel:
@@ -141,39 +144,12 @@ class BaseModel:
         # save results
         metrics_result = {}
 
-        # geodesic errors
-        geo_errors = []
-
         # one iteration
         timer = AvgTimer()
         pbar = tqdm(dataloader)
         for index, data in enumerate(pbar):
             p2p, Pyx, Cxy = self.validate_single(data, timer, tb_logger, index)
             p2p, Pyx, Cxy = to_numpy(p2p), to_numpy(Pyx), to_numpy(Cxy)
-            if 'geo_error' in self.metrics:
-                data_x, data_y = data['first'], data['second']
-                # get geodesic distance matrix
-                if 'dist' in data_x:
-                    dist_x = data_x['dist']
-                else:
-                    dist_x = torch.cdist(data_x['verts'], data_x['verts'])
-
-                # get gt correspondence
-                corr_x = data_x['corr']
-                corr_y = data_y['corr']
-
-                # convert torch.Tensor to numpy.ndarray
-                dist_x = to_numpy(dist_x)
-                corr_x = to_numpy(corr_x)
-                corr_y = to_numpy(corr_y)
-
-                # compute geodesic error
-                geo_err = self.metrics['geo_error'](dist_x, corr_x, corr_y, p2p, return_mean=False)
-
-                # show result
-                pbar.set_description(f'geo error: {geo_err.mean():.4f}')
-
-                geo_errors += [geo_err]
 
             # visualize results
             if self.opt.get('visualize', False):
@@ -200,40 +176,105 @@ class BaseModel:
         logger = get_root_logger()
         logger.info(f'Avg time: {timer.get_avg_time():.4f}')
 
-        if len(geo_errors) != 0:
-            geo_errors = np.concatenate(geo_errors)
-            avg_geo_error = geo_errors.mean()
-            metrics_result['avg_error'] = avg_geo_error
+        # train mode
+        self.train()
 
-            auc, fig, pcks = self.metrics['plot_pck'](geo_errors)
-            metrics_result['auc'] = auc
 
-            if tb_logger is not None:
-                step = self.curr_iter // self.opt['val']['val_freq']
-                tb_logger.add_figure('pck', fig, global_step=step)
-                tb_logger.add_scalar('val auc', auc, global_step=step)
-                tb_logger.add_scalar('val avg error', avg_geo_error, global_step=step)
-            else:
-                # save image
-                plt.savefig(os.path.join(self.opt['path']['visualization'], 'pck.png'))
-                # save pcks
-                np.save(os.path.join(self.opt['path']['visualization'], 'pck.npy'), pcks)
+    @torch.no_grad()
+    def build_ssm(self, dataloader_reference, dataloader_train, dataloader_test):
+        self.eval()
+        logger = get_root_logger()
 
-            # display results
-            logger = get_root_logger()
-            logger.info(f'Val auc: {auc:.4f}')
-            logger.info(f'Val avg error: {avg_geo_error:.4f}')
+        # get reference shape
+        logger.info(f'Getting reference shape based on training set')
+        template_name = self.opt.get('template_name', None)
+        self.get_reference_shape(dataloader_reference, template_name)
+        n_vertices = self.template["verts"].shape[0]
+        logger.info(f'n_vertices of the chosen template: {self.template["name"]} is: {n_vertices}')
 
-            # update best model state dict
-            if update and (self.best_metric is None or (metrics_result['avg_error'] < self.best_metric)):
-                self.best_metric = metrics_result['avg_error']
-                self.best_networks_state_dict = self._get_networks_state_dict()
-                logger.info(f'Best model is updated, average geodesic error: {self.best_metric:.4f}')
+        # deforming template to all training shapes to run PCA
+        deformed_training_shapes = torch.empty(0, n_vertices, 3).to(self.device)
+        pbar = tqdm(dataloader_train)
+        for index, data in enumerate(pbar):
+            deformed_verts, name = self.deform_template(data)
+            deformed_training_shapes = torch.cat((deformed_training_shapes, deformed_verts.unsqueeze(0)), dim=0)
+        deformed_training_shapes = deformed_training_shapes.reshape(deformed_training_shapes.shape[0], -1)
+
+        # build ssm using pca
+        ssm_model = SSMPCA(deformed_training_shapes)
+
+        # deformed test shapes
+        deformed_testing_shapes = torch.empty(0, n_vertices, 3).to(self.device)
+        pbar = tqdm(dataloader_test)
+        for index, data in enumerate(pbar):
+            # deform template to the target test shape
+            deformed_verts, name = self.deform_template(data)
+            deformed_testing_shapes = torch.cat((deformed_testing_shapes, deformed_verts.unsqueeze(0)), dim=0)
+
+        deformed_testing_shapes = deformed_testing_shapes.reshape(deformed_testing_shapes.shape[0], -1)
+
+        if "generalization" in self.metrics:
+            self.metrics["generalization"](ssm_model, dataloader_test, deformed_testing_shapes, logger,
+                                           self.device, self.opt['path']['visualization'], self.template)
+
+        if "specificity" in self.metrics:
+            self.metrics["specificity"](ssm_model, dataloader_train, logger, self.device,
+                                           self.opt['path']['visualization'])
+
+        logger.info(f'Building SSM done!')
 
         # train mode
         self.train()
 
-    def validate_single(self, data, timer):
+
+    @torch.no_grad()
+    def get_reference_shape(self, dataloader, template_name=None):
+        logger = get_root_logger()
+        if template_name is None:
+            # setup losses
+            self.losses = OrderedDict()
+            self._setup_losses()
+
+            self.loss_metrics = OrderedDict()
+
+            pbar = tqdm(dataloader)
+
+            loss_per_pair = dict()
+            for index, data in enumerate(pbar):
+                name, loss = self.get_loss_between_shapes(data)
+                loss_per_pair.setdefault(name, []).append(loss.item())
+
+            mean_dict = {key: np.mean(values) for key, values in loss_per_pair.items()}
+            template_name = min(mean_dict, key=mean_dict.get)
+            min_value = mean_dict[template_name]
+
+
+            logger.info(f'Shape with minimum loss: {template_name} with loss value: {min_value}')
+
+        self.template = {}
+        template_path = self.opt['datasets']['0_reference_dataset']['data_root'] + f'/off/{template_name}.off'
+        csv_path = self.opt['datasets']['0_reference_dataset']['data_root'] + f'/mesh_info.csv'
+        template_verts, template_faces = read_shape(template_path)
+        self.template = self.update_template(self.template, template_name, template_verts, template_faces,
+                                             self.opt['datasets']['0_reference_dataset']['num_evecs'],
+                                             csv_path)
+        logger.info(f'Template initialized!')
+
+    @torch.no_grad()
+    def update_template(self, item, name, verts, faces, num_evecs, csv_path):
+        item['name'] = f"template_shape_{name}"
+        item['verts'] = torch.from_numpy(verts).float()
+        item['faces'] = torch.from_numpy(faces).long()
+        item = get_spectral_ops(item, num_evecs=num_evecs)
+        mesh_info = pd.read_csv(csv_path)
+        current_mesh_info = np.array(mesh_info[mesh_info['file_name'] == name])[0]
+        item['face_area'] = current_mesh_info[4]
+        item['mean'] = torch.from_numpy(np.array([current_mesh_info[1],
+                                                  current_mesh_info[2],
+                                                  current_mesh_info[3]])).float()
+        return item
+
+    def validate_single(self, data, timer, tb_logger, index):
         raise NotImplementedError
 
     def get_loss_metrics(self):
@@ -446,8 +487,9 @@ class BaseModel:
             net_only (bool): only save the network state dict. Default False.
             best (bool): save the best model state dict. Default False.
         """
-        if best:
+        if best and self.best_metric is not None:
             networks_state_dict = self.best_networks_state_dict
+            print("###################################### HERE #####################")
         else:
             networks_state_dict = self._get_networks_state_dict()
 

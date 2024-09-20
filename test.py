@@ -29,10 +29,8 @@ def test_pipeline(root_path):
     # create model
     model = build_model(opt)
 
-    for test_loader in test_loaders:
-        test_set_name = test_loader.dataset.__class__.__name__
-        logger.info(f'Testing {test_set_name}...')
-        model.validation(test_loader, tb_logger=None, update=False)
+    # build_pca
+    model.build_ssm(test_loaders[0], test_loaders[1], test_loaders[2])
 
 
 if __name__ == '__main__':

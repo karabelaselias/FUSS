@@ -4,9 +4,27 @@ import random
 import time
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
 from .dist_util import master_only
 
+
+def plot_with_std(x, y_mean, y_std, title, path):
+    # Plot the mean line
+    plt.plot(x, y_mean, label='Mean')
+
+    # Plot the shaded region for standard deviation
+    plt.fill_between(x, y_mean - y_std, y_mean + y_std, alpha=0.3, label='std')
+
+    # Add labels and legend
+    plt.xlabel('Modes')
+    plt.ylabel('Error')
+    plt.title(title)
+    plt.legend()
+
+    # save plot
+    plt.savefig(path)
+    plt.close()
 
 def set_random_seed(seed):
     """Set random seeds."""
@@ -44,6 +62,7 @@ def make_exp_dirs(opt):
         mkdir_and_rename(path_opt['experiments_root'])
         os.makedirs(path_opt['models'], exist_ok=True)
         os.makedirs(path_opt['log'], exist_ok=True)
+        os.makedirs(path_opt['visualization'], exist_ok=True)
     else:
         mkdir_and_rename(path_opt['results_root'])
         os.makedirs(path_opt['visualization'], exist_ok=True)
