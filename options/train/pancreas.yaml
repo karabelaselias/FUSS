@@ -114,10 +114,10 @@ train:
 val:
   val_freq: 4000
   metrics:
-    geo_error:
-      type: calculate_geodesic_error
-    plot_pck:
-      type: plot_pck
+    specificity:
+      type: calculate_specificity
+    generalization:
+      type: calculate_generalization
 
 # log setting
 logger:
