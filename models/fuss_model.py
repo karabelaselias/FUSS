@@ -362,7 +362,7 @@ class FussModel(BaseModel):
         # from template to shape x
         vert_x_pred_arr = self.compute_displacement(vert_t, vert_x, face_t, None, p2p_tx)
 
-        deformed_verts = vert_x_pred_arr[:, :, self.pose_timestep] * data_t['face_area']
+        deformed_verts = vert_x_pred_arr[:, :, self.pose_timestep] * data_x['face_area']
 
         return deformed_verts, name_x
 
