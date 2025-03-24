@@ -8,9 +8,20 @@ from pytorch3d.ops import sample_points_from_meshes
 from .base_model import BaseModel
 from utils.registry import MODEL_REGISTRY
 from utils.logger import get_root_logger
+from utils.tensor_util import to_device, to_numpy, transfer_batch_to_device
 from utils.tensor_util import to_device, to_numpy
+#from networks.permutation_network import apply_sparse_similarity, compute_permutation_matrix_sparse
+#from networks.permutation_network import SparseSimilarity
 from utils.fmap_util import fmap2pointmap
+from utils.torch_sparse_mm import sparse_mm
+import gc
 
+
+def print_memory_stats(label):
+    print(f"\n=== {label} ===")
+    print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+    print(f"Reserved:  {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+    print(f"Max allocated: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
 @MODEL_REGISTRY.register()
 class FussModel(BaseModel):
@@ -28,62 +39,105 @@ class FussModel(BaseModel):
             self.pose_timestep = self.pose_milestones[self.curr_epoch]
 
     def feed_data(self, data):
-        # get data pair
-        data_x, data_y = to_device(data['first'], self.device), to_device(data['second'], self.device)
-        assert data_x['verts'].shape[0] == 1, 'Only supports batch size = 1.'
+        """process data with PyTorch profiling"""
+        from utils.logger import AvgTimer
 
-        # extract feature
-        feat_x = self.networks['feature_extractor'](data_x['verts'], data_x['faces'])  # [B, Nx, C]
-        feat_y = self.networks['feature_extractor'](data_y['verts'], data_y['faces'])  # [B, Ny, C]
+        # Initialize timers
+        if not hasattr(self, 'network_timers'):
+            self.network_timers = {
+                'feature_extractor': AvgTimer(),
+                'permutation': AvgTimer(),
+                'fmap_net': AvgTimer(),
+                'interpolator': AvgTimer(),
+                'loss_stuff': AvgTimer()
+            }
+        
+        with self.amp_context():
+            #print_memory_stats("Start of feed_data")
+            # get data pair
+            data_x, data_y = transfer_batch_to_device(data['first'], self.device), transfer_batch_to_device(data['second'], self.device)
+            assert data_x['verts'].shape[0] == 1, 'Only supports batch size = 1.'
+            #print(f"Vertex shapes: x={data_x['verts'].shape}, y={data_y['verts'].shape}")
+            
+            # extract feature
+            #feat_x = self.networks['feature_extractor'](data_x['verts'], data_x['faces'])  # [B, Nx, C]
+            #feat_y = self.networks['feature_extractor'](data_y['verts'], data_y['faces'])  # [B, Ny, C]
 
-        Pxy, Pyx = self.compute_permutation_matrix(feat_x, feat_y, bidirectional=True)  # [B, Nx, Ny], [B, Ny, Nx]
+            self.network_timers['feature_extractor'].start()
+            feat_x = self.networks['feature_extractor'](data_x)  # [B, Nx, C]
+            feat_y = self.networks['feature_extractor'](data_y)  # [B, Ny, C]
+            self.network_timers['feature_extractor'].record()
+            
+            #print(f"Feature shapes: x={feat_x.shape}, y={feat_y.shape}")
+            #print_memory_stats("After feature extraction")
+    
+            #print_memory_stats("Before permutation computation")
+            self.network_timers['permutation'].start()
+            Pxy, Pyx = self.compute_permutation_matrix(feat_x, feat_y, bidirectional=True)  # [B, Nx, Ny], [B, Ny, Nx]
+            #print(f"Permutation matrix shapes: Pxy={Pxy.shape}, nnz={Pxy._nnz()}")
+            #print_memory_stats("After permutation computation")
+            self.network_timers['permutation'].record()
+            
+            # compute functional map related loss
+            if 'surfmnet_loss' in self.losses:
+                self.network_timers['fmap_net'].start()
+                self.compute_fmap_loss(data_x, data_y, feat_x, feat_y, Pxy, Pyx)
+                self.network_timers['fmap_net'].record()
+    
+            # Interpolation
+            #Pxy, Pyx = Pxy.squeeze(0), Pyx.squeeze(0)
+            vert_x, vert_y = data_x['verts'].squeeze(0), data_y['verts'].squeeze(0)
+            face_x, face_y = data_x['faces'].squeeze(0), data_y['faces'].squeeze(0)
+    
+            # from shape x to shape y
+            self.network_timers['interpolator'].start()
+            vert_x_pred_arr = self.compute_displacement(vert_x, vert_y, face_x, Pxy)  # [n_vert_x, 3, T+1]
+    
+            # from shape y to shape x
+            vert_y_pred_arr = self.compute_displacement(vert_y, vert_x, face_y, Pyx)  # [n_vert_y, 3, T+1] 
+            
+            # compute alignment loss
+            vert_y_1 = sparse_mm(Pxy, vert_y_pred_arr[:, :, self.pose_timestep])
+            vert_x_1 = sparse_mm(Pyx, vert_x_pred_arr[:, :, self.pose_timestep])
+            self.network_timers['interpolator'].record()
 
-        # compute functional map related loss
-        if 'surfmnet_loss' in self.losses:
-            self.compute_fmap_loss(data_x, data_y, feat_x, feat_y, Pxy, Pyx)
+            self.network_timers['loss_stuff'].start()
+            #Pyx.pull_back(vert_x_pred_arr[:, :, self.pose_timestep])
+            #Pyx @ vert_x_pred_arr[:, :, self.pose_timestep]
+            self.compute_alignment_loss(vert_x, vert_y, vert_x_1, vert_y_1)
+    
+            # compute smoothness regularisation for point map
+            if 'smoothness_loss' in self.losses:
+                Lx, Ly = data_x['L'][0], data_y['L'][0] # this are lists
+                self.compute_smoothness_loss(Pxy, Pyx, Lx, Ly, vert_x, vert_y)
+    
+            if self.pose_timestep > 0 and 'symmetry_loss' in self.losses:
+                # [T+1, n_vert_x, 3]
+                shape_x_diff_arr = self.compute_interpolation_difference(vert_x_pred_arr, vert_y_pred_arr, Pxy)
+                # [T+1, n_vert_y, 3]
+                shape_y_diff_arr = self.compute_interpolation_difference(vert_y_pred_arr, vert_x_pred_arr, Pyx)
+    
+                # compute symmetry loss
+                self.compute_symmetry_loss(shape_x_diff_arr, shape_y_diff_arr)
+    
+            #del Pxy, Pyx
+            
+            # shape deformation losses
+            if 'dirichlet_shape_loss' in self.losses:
+                Lx, Ly = data_x['L'][0], data_y['L'][0]
+                self.compute_shape_interpolation_dirichlet_loss(vert_x, vert_x_pred_arr, Lx)
+                self.compute_shape_interpolation_dirichlet_loss(vert_y, vert_y_pred_arr, Ly)
+    
+            if 'chamfer_shape_loss' in self.losses:
+                self.compute_shape_interpolation_chamfer_loss(vert_x, vert_x_pred_arr, vert_y, vert_y_pred_arr,
+                                                              face_x, face_y)
+    
+            if 'edge_shape_loss' in self.losses:
+                self.compute_shape_edge_loss(vert_x_pred_arr, vert_y_pred_arr, face_x, face_y)
+            
+            self.network_timers['loss_stuff'].record()
 
-        # Interpolation
-        Pxy, Pyx = Pxy.squeeze(0), Pyx.squeeze(0)
-        vert_x, vert_y = data_x['verts'].squeeze(0), data_y['verts'].squeeze(0)
-        face_x, face_y = data_x['faces'].squeeze(0), data_y['faces'].squeeze(0)
-
-        # from shape x to shape y
-        vert_x_pred_arr = self.compute_displacement(vert_x, vert_y, face_x, Pxy)  # [n_vert_x, 3, T+1]
-
-        # from shape y to shape x
-        vert_y_pred_arr = self.compute_displacement(vert_y, vert_x, face_y, Pyx)  # [n_vert_y, 3, T+1]
-
-        # compute alignment loss
-        vert_y_1 = Pxy @ vert_y_pred_arr[:, :, self.pose_timestep]
-        vert_x_1 = Pyx @ vert_x_pred_arr[:, :, self.pose_timestep]
-        self.compute_alignment_loss(vert_x, vert_y, vert_x_1, vert_y_1)
-
-        # compute smoothness regularisation for point map
-        if 'smoothness_loss' in self.losses:
-            Lx, Ly = data_x['L'].squeeze(0), data_y['L'].squeeze(0)
-            self.compute_smoothness_loss(Pxy, Pyx, Lx, Ly, vert_x, vert_y)
-
-        if self.pose_timestep > 0 and 'symmetry_loss' in self.losses:
-            # [T+1, n_vert_x, 3]
-            shape_x_diff_arr = self.compute_interpolation_difference(vert_x_pred_arr, vert_y_pred_arr, Pxy)
-            # [T+1, n_vert_y, 3]
-            shape_y_diff_arr = self.compute_interpolation_difference(vert_y_pred_arr, vert_x_pred_arr, Pyx)
-
-            # compute symmetry loss
-            self.compute_symmetry_loss(shape_x_diff_arr, shape_y_diff_arr)
-
-        # shape deformation losses
-        if 'dirichlet_shape_loss' in self.losses:
-            Lx, Ly = data_x['L'], data_y['L']
-            self.compute_shape_interpolation_dirichlet_loss(vert_x, vert_x_pred_arr, Lx)
-            self.compute_shape_interpolation_dirichlet_loss(vert_y, vert_y_pred_arr, Ly)
-
-        if 'chamfer_shape_loss' in self.losses:
-            self.compute_shape_interpolation_chamfer_loss(vert_x, vert_x_pred_arr, vert_y, vert_y_pred_arr,
-                                                          face_x, face_y)
-
-        if 'edge_shape_loss' in self.losses:
-            self.compute_shape_edge_loss(vert_x_pred_arr, vert_y_pred_arr, face_x, face_y)
+        
 
 
     def compute_shape_interpolation_dirichlet_loss(self, vert_x, vert_x_pred_arr, Lx):
@@ -140,57 +194,90 @@ class FussModel(BaseModel):
 
 
     def compute_permutation_matrix(self, feat_x, feat_y, bidirectional=False):
-        feat_x = F.normalize(feat_x, dim=-1, p=2)
-        feat_y = F.normalize(feat_y, dim=-1, p=2)
-        similarity = torch.bmm(feat_x, feat_y.transpose(1, 2))
-
-        # sinkhorn normalization
-        Pxy = self.networks['permutation'](similarity)
-
+        """
+        Compute permutation matrix using either dense or sparse approach based on input size.
+        """
+        # Check if we're using ScalableSimilarity or original Similarity
+        Pxy = self.networks['sparse_permutation'](feat_x, feat_y)
+        
         if bidirectional:
-            Pyx = self.networks['permutation'](similarity.transpose(1, 2))
+            Pyx = self.networks['sparse_permutation'](feat_y, feat_x)
             return Pxy, Pyx
-        else:
-            return Pxy
 
+        return Pxy
+       
     def compute_displacement(self, vert_x, vert_y, face_x, Pxy=None, p2p_xy=None):
+        """Compute displacement field from shape x to shape y.
+        
+        Args:
+            vert_x: Vertices of shape x [n_vert_x, 3]
+            vert_y: Vertices of shape y [n_vert_y, 3]
+            face_x: Faces of shape x [n_face_x, 3]
+            Pxy: Permutation matrix or (scores, indices) tuple from x to y
+            p2p_xy: Point-to-point map indices
+            
+        Note:
+            If p2p_xy is provided, it is used directly.
+            Otherwise, Pxy is used to compute the alignment.
+        """
         n_vert_x, n_vert_y = vert_x.shape[0], vert_y.shape[0]
-
-        # construct time step
+    
+        # Efficiently compute time steps (can be pre-computed once)
         step_size = 1 / (self.pose_timestep + 1)
-        # [T+1, 1, 1]
-        time_steps = step_size + torch.arange(0, 1, step_size,
-                                              device=self.device, dtype=torch.float32).unsqueeze(1).unsqueeze(2)
-
-        # [T+1, 1, 7]
-        time_steps_up = time_steps * (torch.tensor([0, 0, 0, 0, 0, 0, 1],
-                                                   device=self.device, dtype=torch.float32)).unsqueeze(0).unsqueeze(1)
-        # [1, n_vert_x, 7]
-        vert_y_align = torch.mm(Pxy, vert_y) if p2p_xy is None else vert_y[p2p_xy]
+        time_steps = step_size + torch.arange(0, 1, step_size, device=self.device).unsqueeze(1).unsqueeze(2)
+        time_mask = torch.zeros(7, device=self.device)
+        time_mask[-1] = 1.0
+        time_steps_up = time_steps * time_mask.unsqueeze(0).unsqueeze(1)
+        
+        # Determine how to align vertices - maintain original logic
+        if p2p_xy is not None:
+            # Use point-to-point map directly
+            vert_y_align = vert_y[p2p_xy]
+        elif Pxy is not None:
+            # Use permutation matrix
+            #vert_y_align = apply_sparse_similarity(Pxy, vert_y.unsqueeze(0))
+            vert_y_align = sparse_mm(Pxy, vert_y)
+            #print(vert_y_align.shape)
+        else:
+            raise ValueError("Either Pxy or p2p_xy must be provided")
+        
+        # Rest of the function remains the same
         inputs = torch.cat((
             vert_x, vert_y_align - vert_x,
-            torch.zeros(size=(n_vert_x, 1), device=self.device, dtype=torch.float32)
+            torch.zeros(size=(n_vert_x, 1), device=self.device)
         ), dim=1).unsqueeze(0)
-        # [T+1, n_vert_x, 7]
         inputs = inputs + time_steps_up
-
+    
         # [n_vert_x, 3, T+1]
-        displacements = torch.zeros(size=(inputs.shape[0], inputs.shape[1], 3), device=self.device, dtype=torch.float32)
+        displacements = torch.zeros(size=(inputs.shape[0], inputs.shape[1], 3), device=self.device)
         for i in range(inputs.shape[0]):
             displacements[i] = self.networks['interpolator'](inputs[i].unsqueeze(0), face_x.unsqueeze(0)).squeeze(0)
-
+    
         vert_x_pred_arr = vert_x.unsqueeze(0) + displacements * time_steps
-        vert_x_pred_arr = vert_x_pred_arr.permute([1, 2, 0]).contiguous()  # [n_vert_x, 3, T+1]
-
+        vert_x_pred_arr = vert_x_pred_arr.permute([1, 2, 0]).contiguous()
+    
         return vert_x_pred_arr
 
     def compute_interpolation_difference(self, vert_x_pred_arr, vert_y_pred_arr, Pxy):
+        """Compute the difference between interpolation trajectories.
+        
+        Args:
+            vert_x_pred_arr: Predicted vertices array for shape x [n_vert_x, 3, T+1]
+            vert_y_pred_arr: Predicted vertices array for shape y [n_vert_y, 3, T+1]
+            Pxy: Permutation matrix or (scores, indices) tuple from x to y
+            
+        Returns:
+            shape_x_diff_arr: Differences between trajectories [T, n_vert_x, 3]
+        """
         n_vert_x = vert_x_pred_arr.shape[0]
-        shape_x_diff_arr = torch.zeros(self.pose_timestep, n_vert_x, 3, device=self.device, dtype=torch.float32)
+        shape_x_diff_arr = torch.zeros(self.pose_timestep, n_vert_x, 3, device=self.device)
+        
+        # Handle both dense and sparse matrix formats
         for i in range(self.pose_timestep):
-            shape_x_diff_arr[i] = vert_x_pred_arr[:, :, i] - \
-                                  torch.mm(Pxy, vert_y_pred_arr[:, :, self.pose_timestep - 1 - i])
-
+                # Use sparse matrix multiplication
+                vert_y_aligned = sparse_mm(Pxy, vert_y_pred_arr[:, :, self.pose_timestep - 1 - i])
+                shape_x_diff_arr[i] = vert_x_pred_arr[:, :, i] - vert_y_aligned
+        
         return shape_x_diff_arr
 
     def compute_fmap_loss(self, data_x, data_y, feat_x, feat_y, Pxy, Pyx):
@@ -204,8 +291,12 @@ class FussModel(BaseModel):
         self.loss_metrics = self.losses['surfmnet_loss'](Cxy, Cyx, evals_x, evals_y)
 
         if 'couple_loss' in self.losses:
-            Cyx_est, Cxy_est = torch.bmm(evecs_trans_x, torch.bmm(Pxy, evecs_y)), \
-                               torch.bmm(evecs_trans_y, torch.bmm(Pyx, evecs_x))
+            # Check if using sparse format
+            evecs_y_pb = sparse_mm(Pxy, evecs_y.squeeze()).unsqueeze(0) #apply_sparse_similarity(Pxy, evecs_y)
+            evecs_x_pb = sparse_mm(Pyx, evecs_x.squeeze()).unsqueeze(0)
+                        
+            Cyx_est, Cxy_est = torch.bmm(evecs_trans_x, evecs_y_pb), \
+                               torch.bmm(evecs_trans_y, evecs_x_pb)
 
             self.loss_metrics['l_couple'] = self.losses['couple_loss'](Cxy, Cxy_est) + \
                                          self.losses['couple_loss'](Cyx, Cyx_est)
@@ -219,46 +310,64 @@ class FussModel(BaseModel):
                                        self.losses['align_loss'](vert_y, vert_x_1)
 
     def compute_smoothness_loss(self, Pxy, Pyx, Lx, Ly, vert_x, vert_y):
+        #print(vert_y.shape)
         if 'smoothness_loss' in self.losses:
-            Pxy, Pyx = Pxy.unsqueeze(0), Pyx.unsqueeze(0)
-            Lx, Ly = Lx.unsqueeze(0), Ly.unsqueeze(0)
-            vert_x, vert_y = vert_x.unsqueeze(0), vert_y.unsqueeze(0)
-            self.loss_metrics['l_smooth'] = (self.losses['smoothness_loss'](torch.bmm(Pxy, vert_y), Lx) +
-                                            self.losses['smoothness_loss'](torch.bmm(Pyx, vert_x), Ly))
+            #vert_x, vert_y = vert_x.unsqueeze(0), vert_y.unsqueeze(0)
+            vert_y_pb = sparse_mm(Pxy, vert_y)
+            vert_x_pb = sparse_mm(Pyx, vert_x)
+            #Pxy, Pyx = Pxy.unsqueeze(0), Pyx.unsqueeze(0)
+            self.loss_metrics['l_smooth'] = (self.losses['smoothness_loss'](vert_y_pb.unsqueeze(0), Lx) +
+                                            self.losses['smoothness_loss'](vert_x_pb.unsqueeze(0), Ly))
 
+    def get_timing_metrics(self):
+        """Get timing metrics for wandb logging"""
+        if hasattr(self, 'network_timers'):
+            return {f'network_time/{k}': v.get_avg_time() for k, v in self.network_timers.items()}
+        return {}
+        
     def optimize_parameters(self):
-        # compute total loss
-        loss = 0.0
-        for k, v in self.loss_metrics.items():
-            if k != 'l_total':
-                loss += v
-
-        # update loss metrics
-        self.loss_metrics['l_total'] = loss
-
         # zero grad
         for name in self.optimizers:
-            self.optimizers[name].zero_grad()
-
+            self.optimizers[name].zero_grad(set_to_none=True)
+        
+        # Using autocast for mixed-precision training
+        with self.amp_context():
+            # compute total loss
+            loss = sum(v for k, v in self.loss_metrics.items() if k != 'l_total')
+            # update loss metrics
+            self.loss_metrics['l_total'] = loss
+    
+        
+        # backward pass with gradient scaling
+        self.scaler.scale(loss).backward()
         # backward pass
-        loss.backward()
+        #loss.backward()
 
-        # clip gradient for stability
-        for key in self.networks:
-            torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
-
+        # clip gradient for stability - FIX HERE:
+        if self.opt.get('clip_grad', True):
+            # Only unscale optimizers that exist
+            for name in self.optimizers:
+                self.scaler.unscale_(self.optimizers[name])
+                
+            # Then clip gradients for all networks
+            for key in self.networks:
+                torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
+    
         # update weight
         for name in self.optimizers:
-            self.optimizers[name].step()
+            self.scaler.step(self.optimizers[name])
 
+        # Update scaler for next iteration
+        self.scaler.update()
+        
     def validate_single(self, data, timer, tb_logger, index):
         # get data pair
-        data_x, data_y = to_device(data['first'], self.device), to_device(data['second'], self.device)
+        data_x, data_y = transfer_batch_to_device(data['first'], self.device), transfer_batch_to_device(data['second'], self.device)
         vert_x, face_x = data_x['verts'], data_x['faces']
         vert_y, face_y = data_y['verts'], data_y['faces']
 
         # get spectral operators
-        evecs_x = data_x['evecs'].squeeze()
+        evecs_x = data_x['evecs'].squeeze() # get rid of the Batch dim
         evecs_y = data_y['evecs'].squeeze()
         evecs_trans_x = data_x['evecs_trans'].squeeze()
         evecs_trans_y = data_y['evecs_trans'].squeeze()
@@ -267,14 +376,20 @@ class FussModel(BaseModel):
         timer.start()
 
         # feature extractor
-        feat_x = self.networks['feature_extractor'](data_x['verts'], data_x.get('faces'))
-        feat_y = self.networks['feature_extractor'](data_y['verts'], data_y.get('faces'))
+        #feat_x = self.networks['feature_extractor'](data_x['verts'], data_x.get('faces'))
+        #feat_y = self.networks['feature_extractor'](data_y['verts'], data_y.get('faces'))
 
+        feat_x = self.networks['feature_extractor'](data_x)
+        feat_y = self.networks['feature_extractor'](data_y)
 
         Pxy, Pyx = self.compute_permutation_matrix(feat_x, feat_y, bidirectional=True)
-        Pxy, Pyx = Pxy.squeeze(0), Pyx.squeeze(0)
-        Cxy = evecs_trans_y @ (Pyx @ evecs_x)
-        Cyx = evecs_trans_x @ (Pxy @ evecs_y)
+
+        temp_y = sparse_mm(Pxy, evecs_y) #apply_sparse_similarity(Pxy, evecs_y)
+        temp_x = sparse_mm(Pyx, evecs_x) #apply_sparse_similarity(Pyx, evecs_x)
+
+        Cxy = evecs_trans_y @ temp_x #(Pyx @ evecs_x)
+        Cyx = evecs_trans_x @ temp_y #(Pxy @ evecs_y)
+        
         # convert functional map to point-to-point map
         p2p_yx = fmap2pointmap(Cxy, evecs_x, evecs_y)
         p2p_xy = fmap2pointmap(Cyx, evecs_y, evecs_x)
@@ -296,33 +411,51 @@ class FussModel(BaseModel):
 
         # save the visualization
         if tb_logger is not None and index % 60 == 1:
+            from utils.logger import log_mesh
             step = self.curr_iter // self.opt['val']['val_freq']
-            tb_logger.add_mesh(f'{index}/{0}', vertices=vert_x, faces=face_x, global_step=step)
+            # Log original mesh
+            log_mesh(tb_logger, f'{index}/{0}', vertices=vert_x, faces=face_x, global_step=step)
+            
+            #tb_logger.add_mesh(f'{index}/{0}', vertices=vert_x, faces=face_x, global_step=step)
+
+            # Add topo transfer and original
+            vert_y_align = vert_y[0][p2p_xy]
+            log_mesh(tb_logger, f'{index}/{self.pose_timestep + 2}',
+                     vertices=vert_y_align.unsqueeze(0),
+                     faces=face_x, global_step=step)
+            log_mesh(tb_logger, f'{index}/{self.pose_timestep + 3}', 
+                     vertices=vert_y, faces=face_y,
+                     global_step=step)
 
             # add topo transfer and original
-            vert_y_align = vert_y[0][p2p_xy]
-            tb_logger.add_mesh(f'{index}/{self.pose_timestep + 2}',
-                               vertices=vert_y_align.unsqueeze(0),
-                               faces=face_x, global_step=step)
-            tb_logger.add_mesh(f'{index}/{self.pose_timestep + 3}', vertices=vert_y, faces=face_y,
-                               global_step=step)
+            #vert_y_align = vert_y[0][p2p_xy]
+            #tb_logger.add_mesh(f'{index}/{self.pose_timestep + 2}',
+            #                   vertices=vert_y_align.unsqueeze(0),
+            #                   faces=face_x, global_step=step)
+            #tb_logger.add_mesh(f'{index}/{self.pose_timestep + 3}', vertices=vert_y, faces=face_y,
+            #                   global_step=step)
 
             for i in range(self.pose_timestep + 1):
                 point_pred = vert_x_pred_arr[..., i].unsqueeze(0)
-                tb_logger.add_mesh(f'{index}/{i + 1}', vertices=point_pred, faces=face_x,
-                                   global_step=step)
+                log_mesh(tb_logger, f'{index}/{i + 1}', vertices=point_pred, faces=face_x, global_step=step)
+                #tb_logger.add_mesh(f'{index}/{i + 1}', vertices=point_pred, faces=face_x,
+                #                   global_step=step)
 
         return p2p_yx, Pyx, Cxy
 
     @torch.no_grad()
     def get_loss_between_shapes(self, data):
-        data_x, data_y = to_device(data['first'], self.device), to_device(data['second'], self.device)
+        data_x, data_y = transfer_batch_to_device(data['first'], self.device), transfer_batch_to_device(data['second'], self.device)
         assert data_x['verts'].shape[0] == 1, 'Only supports batch size = 1.'
 
         # extract feature
-        feat_x = self.networks['feature_extractor'](data_x['verts'], data_x['faces'])  # [B, Nx, C]
-        feat_y = self.networks['feature_extractor'](data_y['verts'], data_y['faces'])  # [B, Ny, C]
+        #feat_x = self.networks['feature_extractor'](data_x['verts'], data_x['faces'])  # [B, Nx, C]
+        #feat_y = self.networks['feature_extractor'](data_y['verts'], data_y['faces'])  # [B, Ny, C]
 
+        feat_x = self.networks['feature_extractor'](data_x)  # [B, Nx, C]
+        feat_y = self.networks['feature_extractor'](data_y)  # [B, Ny, C]
+
+        
         Pxy, Pyx = self.compute_permutation_matrix(feat_x, feat_y, bidirectional=True)  # [B, Nx, Ny], [B, Ny, Nx]
 
         # compute functional map related loss
@@ -337,7 +470,7 @@ class FussModel(BaseModel):
 
     @torch.no_grad()
     def deform_template(self, data):
-        data_t, data_x = to_device(self.template, self.device), to_device(data, self.device)
+        data_t, data_x = transfer_batch_to_device(self.template, self.device), transfer_batch_to_device(data, self.device)
         name_t, name_x = data_t['name'], data_x['name'][0]
 
         # get spectral operators
@@ -354,8 +487,8 @@ class FussModel(BaseModel):
 
         # Interpolation
         Ptx = self.compute_permutation_matrix(feat_t, feat_x, bidirectional=False)  # [B, Nx, Ny], [B, Ny, Nx]
-        Ptx = Ptx.squeeze(0)
-        Cxt = evecs_trans_t @ (Ptx @ evecs_x)
+        temp_tx = sparse_mm(Ptx, evecs_x.squeeze(0))
+        Cxt = evecs_trans_t @ temp_tx.unsqueeze(0) #(Ptx @ evecs_x)
         # convert functional map to point-to-point map
         p2p_tx = fmap2pointmap(Cxt, evecs_x, evecs_t)
 
@@ -369,12 +502,17 @@ class FussModel(BaseModel):
     @torch.no_grad()
     def validation(self, dataloader, tb_logger, update=True):
         # change permutation prediction status
-        if 'permutation' in self.networks:
-            self.networks['permutation'].hard = True
+        if 'sparse_permutation' in self.networks:
+            old_k = self.networks['sparse_permutation'].k_neighbors
+            self.networks['sparse_permutation'].k_neighbors = 1
+            self.networks['sparse_permutation'].hard = False
+            #self.networks['sparse_permutation'].use_streams = False
         if 'fmap_net' in self.networks:
             self.networks['fmap_net'].bidirectional = False
         super(FussModel, self).validation(dataloader, tb_logger, update)
-        if 'permutation' in self.networks:
-            self.networks['permutation'].hard = False
+        if 'sparse_permutation' in self.networks:
+            self.networks['sparse_permutation'].k_neighbors = old_k
+            self.networks['sparse_permutation'].hard = False
+            #self.networks['sparse_permutation'].use_streams = self.networks['sparse_permutation'].streams > 1
         if 'fmap_net' in self.networks:
             self.networks['fmap_net'].bidirectional = True

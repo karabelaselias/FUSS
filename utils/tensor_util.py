@@ -8,6 +8,20 @@ def _to_device(x, device):
         x = x.to(device=device)
     return x
 
+def transfer_batch_to_device(batch, device):
+    """Efficiently transfer a batch to the specified device"""
+    device_batch = {}
+    for key, value in batch.items():
+        if isinstance(value, list) and len(value) > 0 and torch.is_tensor(value[0]):
+            # Handle list of sparse tensors
+            device_batch[key] = [t.to_sparse_csr().to(device=device) for t in value]
+        elif torch.is_tensor(value):
+            # Handle dense tensors
+            device_batch[key] = value.to(device)
+        else:
+            # Handle non-tensor data
+            device_batch[key] = value         
+    return device_batch
 
 def to_device(x, device):
     if isinstance(x, list):

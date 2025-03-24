@@ -8,6 +8,8 @@ from tqdm import tqdm
 import pandas as pd
 from collections import OrderedDict
 
+import inspect
+
 import torch
 import torch.optim as optim
 from torch.nn.parallel import DataParallel, DistributedDataParallel
@@ -26,6 +28,7 @@ from utils.shape_util import read_shape
 from datasets.shape_dataset import get_spectral_ops
 from models.pca_model import SSMPCA
 
+from torch.cuda.amp import autocast, GradScaler
 
 class BaseModel:
     """
@@ -41,9 +44,12 @@ class BaseModel:
              opt (dict): option dictionary contains all information related to model.
         """
         self.opt = opt
-        self.device = torch.device('cuda' if opt['num_gpu'] != 0 else 'cpu')
+        self.setup_device()
+        #self.device = torch.device('cuda' if opt['num_gpu'] != 0 else 'cpu')
         self.is_train = opt['is_train']
 
+        self.scaler = GradScaler(enabled=(self.device.type == 'cuda' and opt.get('use_amp', False)))
+        
         # build networks
         self.networks = OrderedDict()
         self._setup_networks()
@@ -73,36 +79,58 @@ class BaseModel:
                 self.resume_model(state_dict, net_only=False)
             else:  # only resume model for validation
                 self.resume_model(state_dict, net_only=True)
-
+    
+    def setup_device(self):
+        """Setup compute device"""
+        if torch.cuda.is_available() and self.opt['num_gpu'] != 0:
+            self.device = torch.device(f"cuda:{self.opt.get('device', 0)}")
+        else:
+            self.device = torch.device("cpu")
+    
     def feed_data(self, data):
-        """process data"""
-        pass
+        with self.amp_context():
+            """process data"""
+            pass
 
     def optimize_parameters(self):
         """forward pass"""
-        # compute total loss
-        loss = 0.0
-        for k, v in self.loss_metrics.items():
-            if k != 'l_total':
-                loss += v
-
-        # update loss metrics
-        self.loss_metrics['l_total'] = loss
-
+        
+        # Using autocast for mixed-precision training
+        with self.amp_context():
+            # compute total loss
+            loss = 0.0
+            for k, v in self.loss_metrics.items():
+                if k != 'l_total':
+                    loss += v
+            # update loss metrics
+            self.loss_metrics['l_total'] = loss
+        
+        
         # zero grad
         for name in self.optimizers:
-            self.optimizers[name].zero_grad()
+            self.optimizers[name].zero_grad(set_to_none=True)
 
+        # backward pass with gradient scaling
+        self.scaler.scale(loss).backward()
         # backward pass
-        loss.backward()
+        #loss.backward()
 
         # clip gradient for stability
-        for key in self.networks:
-            torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
+        if self.opt.get('clip_grad', True):
+            for key in self.networks:
+                self.scaler.unscale_(self.optimizers[key])
+                torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
+
+        # clip gradient for stability
+        #for key in self.networks:
+        #    torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
 
         # update weight
         for name in self.optimizers:
-            self.optimizers[name].step()
+            self.scaler.step(self.optimizers[name])
+
+        # Update scaler for next iteration
+        self.scaler.update()
 
     def update_model_per_iteration(self):
         """update model per iteration"""
@@ -130,6 +158,10 @@ class BaseModel:
         """
         return [optimizer.param_groups[0]['lr'] for optimizer in self.optimizers.values()]
 
+    def amp_context(self):
+        """Returns an autocast context manager configured according to model settings"""
+        return torch.amp.autocast(device_type = self.device.type, enabled=(self.device.type == 'cuda' and self.opt.get('use_amp', False)))
+    
     @torch.no_grad()
     def validation(self, dataloader, tb_logger, update=True):
         """Validation function.
@@ -139,7 +171,9 @@ class BaseModel:
             tb_logger (tensorboard logger): Tensorboard logger.
             update (bool): update best metric and best model. Default True
         """
-        self.eval()
+        # Always disable autocast for validation
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            self.eval()
 
         # save results
         metrics_result = {}

@@ -3,48 +3,31 @@ import torch.nn as nn
 
 from utils.registry import NETWORK_REGISTRY
 
-
-def _get_mask(evals1, evals2, resolvant_gamma):
-    scaling_factor = max(torch.max(evals1), torch.max(evals2))
-    evals1, evals2 = evals1 / scaling_factor, evals2 / scaling_factor
-    evals_gamma1 = (evals1 ** resolvant_gamma)[None, :]
-    evals_gamma2 = (evals2 ** resolvant_gamma)[:, None]
-
-    M_re = evals_gamma2 / (evals_gamma2.square() + 1) - evals_gamma1 / (evals_gamma1.square() + 1)
-    M_im = 1 / (evals_gamma2.square() + 1) - 1 / (evals_gamma1.square() + 1)
-    return M_re.square() + M_im.square()
-
-
 def get_mask(evals1, evals2, resolvant_gamma):
+    """Compute mask for functional map regularization"""
     masks = []
     for bs in range(evals1.shape[0]):
-        masks.append(_get_mask(evals1[bs], evals2[bs], resolvant_gamma))
+        scaling_factor = max(torch.max(evals1[bs]), torch.max(evals2[bs]))
+        evals1_norm, evals2_norm = evals1[bs] / scaling_factor, evals2[bs] / scaling_factor
+        evals_gamma1 = (evals1_norm ** resolvant_gamma)[None, :]
+        evals_gamma2 = (evals2_norm ** resolvant_gamma)[:, None]
+
+        M_re = evals_gamma2 / (evals_gamma2.square() + 1) - evals_gamma1 / (evals_gamma1.square() + 1)
+        M_im = 1 / (evals_gamma2.square() + 1) - 1 / (evals_gamma1.square() + 1)
+        masks.append(M_re.square() + M_im.square())
     return torch.stack(masks, dim=0)
 
-
+# Optimized implementation
 @NETWORK_REGISTRY.register()
-class RegularizedFMNet(nn.Module):
-    """Compute the functional map matrix representation in DPFM"""
+class RegularizedFMNetOptimized(torch.nn.Module):
     def __init__(self, lmbda=100, resolvant_gamma=0.5, bidirectional=False):
-        super(RegularizedFMNet, self).__init__()
+        super(RegularizedFMNetOptimized, self).__init__()
         self.lmbda = lmbda
         self.resolvant_gamma = resolvant_gamma
         self.bidirectional = bidirectional
 
-    def forward(self, feat_x, feat_y, evals_x, evals_y, evecs_trans_x, evecs_trans_y):
-        """
-        Forward pass to compute functional map
-        Args:
-            feat_x (torch.Tensor): feature vector of shape x. [B, Vx, C].
-            feat_y (torch.Tensor): feature vector of shape y. [B, Vy, C].
-            evals_x (torch.Tensor): eigenvalues of shape x. [B, K].
-            evals_y (torch.Tensor): eigenvalues of shape y. [B, K].
-            evecs_trans_x (torch.Tensor): pseudo inverse of eigenvectors of shape x. [B, K, Vx].
-            evecs_trans_y (torch.Tensor): pseudo inverse of eigenvectors of shape y. [B, K, Vy].
-
-        Returns:
-            C (torch.Tensor): functional map from shape x to shape y. [B, K, K].
-        """
+    def _comp_fmap(self, feat_x, feat_y, evals_x, evals_y, evecs_trans_x, evecs_trans_y):
+        """Optimized implementation using linear solve and chunking"""
         A = torch.bmm(evecs_trans_x, feat_x)  # [B, K, C]
         B = torch.bmm(evecs_trans_y, feat_y)  # [B, K, C]
 
@@ -54,30 +37,60 @@ class RegularizedFMNet(nn.Module):
         A_A_t = torch.bmm(A, A_t)  # [B, K, K]
         B_A_t = torch.bmm(B, A_t)  # [B, K, K]
 
-        C_i = []
-        for i in range(evals_x.shape[1]):
-            D_i = torch.cat([torch.diag(D[bs, i, :].flatten()).unsqueeze(0) for bs in range(evals_x.shape[0])], dim=0)
-            C = torch.bmm(torch.inverse(A_A_t + self.lmbda * D_i), B_A_t[:, [i], :].transpose(1, 2))
-            C_i.append(C.transpose(1, 2))
+        B_size, K, _ = A.shape
+        _, num_points_x, _ = feat_x.shape  # Extract number of points
+        _, num_points_y, _ = feat_y.shape
+        num_points = max(num_points_x, num_points_y)
+        
+        Cxy = torch.zeros((B_size, K, K), device=feat_x.device, dtype=feat_x.dtype)
+        
+        # Process in chunks to reduce memory usage
+        # Adaptive chunk sizing for optimal performance
+        if num_points < 10000:  # Small scale
+            chunk_size = min(32, K)
+        elif num_points < 100000:  # Medium scale
+            chunk_size = min(64, K)
+        else:  # Large scale
+            chunk_size = K  # No chunking for large scale
 
-        Cxy = torch.cat(C_i, dim=1)
+        for chunk_start in range(0, K, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, K)
+            
+            # Pre-allocate a batch of diagonal matrices for this chunk
+            D_batch = torch.zeros((B_size, chunk_end-chunk_start, K, K), device=A_A_t.device, dtype=A_A_t.dtype)
+            
+            # Fill diagonal matrices efficiently for all batch items and chunk rows
+            for b in range(B_size):
+                for i_rel, i_abs in enumerate(range(chunk_start, chunk_end)):
+                    D_batch[b, i_rel].diagonal().copy_(D[b, i_abs])
+            
+            # Stack the system matrices and right-hand sides
+            systems = A_A_t.unsqueeze(1) + self.lmbda * D_batch  # [B, chunk_size, K, K]
+            rhs = B_A_t[:, chunk_start:chunk_end].transpose(2, 1).unsqueeze(-1)  # [B, K, chunk_size, 1]
+            
+            # Reshape for batched solve
+            systems_flat = systems.reshape(-1, K, K)  # [B*chunk_size, K, K]
+            rhs_flat = rhs.permute(0, 2, 1, 3).reshape(-1, K, 1)  # [B*chunk_size, K, 1]
 
+            # Selectively cast to float32 for linear solve
+            systems_flat = systems_flat.float()
+            rhs_flat = rhs_flat.float()
+            
+            # Solve all systems in the chunk at once
+            C_flat = torch.linalg.solve(systems_flat, rhs_flat)
+            
+            # Convert back to original dtype if needed
+            C_flat = C_flat.to(feat_x.dtype)
+            
+            # Reshape back and store results
+            C_chunk = C_flat.reshape(B_size, chunk_end-chunk_start, K, 1)
+            Cxy[:, chunk_start:chunk_end] = C_chunk.squeeze(-1)
+            
+        return Cxy
+    
+    def forward(self, feat_x, feat_y, evals_x, evals_y, evecs_trans_x, evecs_trans_y):
+        Cxy = self._comp_fmap(feat_x, feat_y, evals_x, evals_y, evecs_trans_x, evecs_trans_y)
+        Cyx = None
         if self.bidirectional:
-            D = get_mask(evals_y, evals_x, self.resolvant_gamma)  # [B, K, K]
-
-            B_t = B.transpose(1, 2)  # [B, C, K]
-            B_B_t = torch.bmm(B, B_t)  # [B, K, K]
-            A_B_t = torch.bmm(A, B_t)  # [B, K, K]
-
-            C_i = []
-            for i in range(evals_y.shape[1]):
-                D_i = torch.cat([torch.diag(D[bs, i, :].flatten()).unsqueeze(0) for bs in range(evals_y.shape[0])],
-                                dim=0)
-                C = torch.bmm(torch.inverse(B_B_t + self.lmbda * D_i), A_B_t[:, [i], :].transpose(1, 2))
-                C_i.append(C.transpose(1, 2))
-
-            Cyx = torch.cat(C_i, dim=1)
-        else:
-            Cyx = None
-
+            Cyx = self._comp_fmap(feat_y, feat_x, evals_y, evals_x, evecs_trans_y, evecs_trans_x)
         return Cxy, Cyx

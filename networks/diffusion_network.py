@@ -5,7 +5,34 @@ import torch.nn as nn
 
 from utils.geometry_util import get_all_operators, to_basis, from_basis, compute_hks_autoscale, compute_wks_autoscale
 from utils.registry import NETWORK_REGISTRY
+from utils.torch_sparse_mm import sparse_mm
 
+def get_activation(activation_str: str) -> nn.Module:
+    """
+    Get activation function from string specification
+    
+    Args:
+        activation_str: Name of activation function ('relu', 'gelu', etc.)
+    Returns:
+        PyTorch activation module
+    """
+    activations = {
+        'relu': nn.ReLU(),
+        'gelu': nn.GELU(),
+        'leaky_relu': nn.LeakyReLU(),
+        'elu': nn.ELU(),
+        'silu': nn.SiLU(),  # Also known as Swish
+        'tanh': nn.Tanh()
+    }
+    
+    activation_str = activation_str.lower()  # Make case-insensitive
+    if activation_str not in activations:
+        raise ValueError(
+            f"Unknown activation function: {activation_str}. "
+            f"Available activations: {list(activations.keys())}"
+        )
+    
+    return activations[activation_str]
 
 class LearnedTimeDiffusion(nn.Module):
     """
@@ -23,11 +50,12 @@ class LearnedTimeDiffusion(nn.Module):
         super(LearnedTimeDiffusion, self).__init__()
         assert method in ['spectral', 'implicit_dense'], f'Invalid method: {method}'
         self.in_channels = in_channels
+        #self.diffusion_time = nn.Parameter(torch.zeros(in_channels))
         self.diffusion_time = nn.Parameter(torch.Tensor(in_channels))
         self.method = method
         # init as zero
         nn.init.constant_(self.diffusion_time, 0.0)
-
+        
     def forward(self, feat, L, mass, evals, evecs):
         """
         Args:
@@ -51,11 +79,13 @@ class LearnedTimeDiffusion(nn.Module):
             feat_spec = to_basis(feat, evecs, mass)
 
             # Diffuse
-            diffuse_coefs = torch.exp(-evals.unsqueeze(-1) * self.diffusion_time.unsqueeze(0))
-            feat_diffuse_spec = diffuse_coefs * feat_spec
+            time = self.diffusion_time
+            diffuse_coefs = (-evals.unsqueeze(-1) * time.unsqueeze(0)).exp_()
+            feat_spec.mul_(diffuse_coefs)
+            #feat_diffuse_spec = diffuse_coefs * feat_spec
 
             # Transform back to feature
-            feat_diffuse = from_basis(feat_diffuse_spec, evecs)
+            feat_diffuse = from_basis(feat_spec, evecs)
 
         else: # 'implicit_dense'
             V = feat.shape[-2]
@@ -79,85 +109,87 @@ class LearnedTimeDiffusion(nn.Module):
 
 class SpatialGradientFeatures(nn.Module):
     """
-    Compute dot-products between input vectors.
-    Uses a learned complex-linear layer to keep dimension down.
+    Compute dot-products between input vectors. Uses a learned complex-linear layer to keep dimension down.
+    
+    Input:
+        - vectors: (V,C,2)
+    Output:
+        - dots: (V,C) dots 
     """
-    def __init__(self, in_channels, with_gradient_rotations=True):
-        """
-        Args:
-            in_channels (int): number of input channels.
-            with_gradient_rotations (bool, optional): whether with gradient rotations. Default True.
-        """
+
+    def __init__(self, C_inout : int, with_gradient_rotations : bool  = True) -> None:
         super(SpatialGradientFeatures, self).__init__()
 
-        self.in_channels = in_channels
+        self.C_inout = C_inout
         self.with_gradient_rotations = with_gradient_rotations
+        # Use ModuleDict for better organization
+        self.transforms = nn.ModuleDict()
 
         if self.with_gradient_rotations:
-            self.A_re = nn.Linear(self.in_channels, self.in_channels, bias=False)
-            self.A_im = nn.Linear(self.in_channels, self.in_channels, bias=False)
+            self.transforms.update({
+                'A_re': nn.Linear(C_inout, C_inout, bias=False),
+                'A_im': nn.Linear(C_inout, C_inout, bias=False)
+            })
         else:
-            self.A = nn.Linear(self.in_channels, self.in_channels, bias=False)
+            self.transforms['A'] = nn.Linear(C_inout, C_inout, bias=False)
 
-    def forward(self, feat_in):
-        """
-        Args:
-            feat_in (torch.Tensor): input feature vector (B, V, C, 2).
-        Returns:
-            feat_out (torch.Tensor): output feature vector (B, V, C)
-        """
-        feat_a = feat_in
-
+    def forward(self, vectors : torch.Tensor) -> torch.Tensor :
+        
         if self.with_gradient_rotations:
-            feat_real_b = self.A_re(feat_in[..., 0]) - self.A_im(feat_in[..., 1])
-            feat_img_b = self.A_re(feat_in[..., 0]) + self.A_im(feat_in[..., 1])
+            real_part = vectors[..., 0]
+            imag_part = vectors[..., 1]
+            
+            # Compute transformations (with masking)
+            vectorsBreal = (self.transforms['A_re'](real_part) - 
+                          self.transforms['A_im'](imag_part))
+            vectorsBimag = (self.transforms['A_re'](imag_part) + 
+                          self.transforms['A_im'](real_part))
         else:
-            feat_real_b = self.A(feat_in[..., 0])
-            feat_img_b = self.A(feat_in[..., 1])
-
-        feat_out = feat_a[..., 0] * feat_real_b + feat_a[..., 1] * feat_img_b
-
-        return torch.tanh(feat_out)
+            vectorsBreal = self.transforms['A'](vectors[..., 0])
+            vectorsBimag = self.transforms['A'](vectors[..., 1])
+        
+        # Compute dots efficiently
+        dots = (vectors[..., 0] * vectorsBreal + 
+                vectors[..., 1] * vectorsBimag)
+        return torch.tanh(dots)
 
 
 @NETWORK_REGISTRY.register()
-class MiniMLP(nn.Sequential):
-    """
-    A simple MLP with configurable hidden layer sizes
-    """
-    def __init__(self, layer_sizes, dropout=False, activation=nn.ReLU, name='miniMLP'):
-        """
-        Args:
-            layer_sizes (List): list of layer size.
-            dropout (bool, optional): whether use dropout. Default False.
-            activation (nn.Module, optional): activation function. Default ReLU.
-            name (str, optional): module name. Default 'miniMLP'
-        """
-        super(MiniMLP, self).__init__()
+class MiniMLP(nn.Module):
+    '''
+    A simple MLP with configurable hidden layer sizes.
+    '''  
+    def __init__(self, layer_sizes, dropout=False, activation='relu', name='miniMLP'):
+        super().__init__()
 
+        self.activation = get_activation(activation)
+        
+        # Use ModuleList for better organization
+        self.layers = nn.ModuleList()
+        
         for i in range(len(layer_sizes) - 1):
-            is_last = (i + 2 == len(layer_sizes))
-
-            # Dropout Layer
+            # Add dropout before linear layers (except first)
             if dropout and i > 0:
-                self.add_module(
-                    name + '_dropout_{:03d}'.format(i),
-                    nn.Dropout(p=0.5)
-                )
+                self.layers.append(nn.Dropout(p=0.5))
 
-            # Affine Layer
-            self.add_module(
-                name + '_linear_{:03d}'.format(i),
-                nn.Linear(layer_sizes[i], layer_sizes[i+1])
+             # Always add normalization for stability with non-ReLU
+            #if i > 0:  # Skip first layer
+            #    self.layers.append(nn.LayerNorm(layer_sizes[i]))
+            
+            # Add linear layer
+            self.layers.append(
+                nn.Linear(layer_sizes[i], layer_sizes[i + 1])
             )
-
-            # Activation Layer
-            if not is_last:
-                self.add_module(
-                    name + '_activation_{:03d}'.format(i),
-                    activation()
-                )
-
+            
+            # Add activation (except after last layer)
+            if i < len(layer_sizes) - 2:
+                self.layers.append(self.activation)
+        
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+        
 
 class DiffusionNetBlock(nn.Module):
     """
@@ -184,21 +216,22 @@ class DiffusionNetBlock(nn.Module):
         self.with_gradient_features = with_gradient_features
         self.with_gradient_rotations = with_gradient_rotations
 
-        # Diffusion block
-        self.diffusion = LearnedTimeDiffusion(self.in_channels, method=diffusion_method)
-
         # concat of both diffused features and original features
-        self.mlp_in_channels = 2 * self.in_channels
-
-        # Spatial gradient block
-        if self.with_gradient_features:
-            self.gradient_features = SpatialGradientFeatures(self.in_channels,
-                                                             with_gradient_rotations=self.with_gradient_rotations)
-            # concat of gradient features
-            self.mlp_in_channels += self.in_channels
-
-        # MLP block
-        self.mlp = MiniMLP([self.mlp_in_channels] + self.mlp_hidden_channels + [self.in_channels], dropout=self.dropout)
+        self.mlp_in_channels = 2 * self.in_channels + (self.in_channels if with_gradient_features else 0)
+        
+        # Use ModuleDict for better organization
+        self.layers = nn.ModuleDict({
+            'diffusion': LearnedTimeDiffusion(in_channels),
+            'mlp': MiniMLP([self.mlp_in_channels] + self.mlp_hidden_channels + [self.in_channels], 
+                          dropout=dropout, activation = 'relu'),
+            'LN1' : nn.LayerNorm(in_channels),
+            'LN2' : nn.LayerNorm(self.mlp_in_channels)
+        })
+        
+        if with_gradient_features:
+            self.layers['gradient_features'] = SpatialGradientFeatures(
+                self.in_channels, with_gradient_rotations=with_gradient_rotations
+            )
 
     def forward(self, feat_in, mass, L, evals, evecs, gradX, gradY):
         """
@@ -215,23 +248,25 @@ class DiffusionNetBlock(nn.Module):
         B = feat_in.shape[0]
         assert feat_in.shape[-1] == self.in_channels, f'Expected feature channel: {self.in_channels}, but got: {feat_in.shape[-1]}'
 
+        # Pre-norm before diffusion
+        feat_norm = self.layers['LN1'](feat_in)
+        
         # Diffusion block
-        feat_diffuse = self.diffusion(feat_in, L, mass, evals, evecs)
+        feat_diffuse = self.layers['diffusion'](feat_norm, L, mass, evals, evecs)
 
         # Compute gradient features
-        if self.with_gradient_features:
+        if 'gradient_features' in self.layers:
             # Compute gradient
             feat_grads = []
             for b in range(B):
                 # gradient after diffusion
-                feat_gradX = torch.mm(gradX[b, ...], feat_diffuse[b, ...])
-                feat_gradY = torch.mm(gradY[b, ...], feat_diffuse[b, ...])
-
+                feat_gradX = sparse_mm(gradX[b], feat_diffuse[b])
+                feat_gradY = sparse_mm(gradY[b], feat_diffuse[b])
                 feat_grads.append(torch.stack((feat_gradX, feat_gradY), dim=-1))
             feat_grad = torch.stack(feat_grads, dim=0) # [B, V, C, 2]
 
             # Compute gradient features
-            feat_grad_features = self.gradient_features(feat_grad)
+            feat_grad_features = self.layers['gradient_features'](feat_grad)
 
             # Stack inputs to MLP
             feat_combined = torch.cat((feat_in, feat_diffuse, feat_grad_features), dim=-1)
@@ -239,13 +274,13 @@ class DiffusionNetBlock(nn.Module):
             # Stack inputs to MLP
             feat_combined = torch.cat((feat_in, feat_diffuse), dim=-1)
 
+        feat_combined_norm = self.layers['LN2'](feat_combined)
+        
         # MLP block
-        feat_out = self.mlp(feat_combined)
+        feat_out = self.layers['mlp'](feat_combined_norm)
 
         # Skip connection
-        feat_out = feat_out + feat_in
-
-        return feat_out
+        return feat_out + feat_in
 
 
 @NETWORK_REGISTRY.register()
@@ -336,36 +371,61 @@ class DiffusionNet(nn.Module):
             )
             blocks += [block]
         self.blocks = nn.ModuleList(blocks)
-
-    def forward(self, verts, faces=None, feats=None):
+    
+    #@torch.compile(dynamic=True)
+    def forward(self, data):
+        verts = data['verts']
         assert verts.dim() == 3, 'Only support batch operation'
+
+        mass = data['mass']
+        assert mass.dim() == 2, 'Only support batch operation'
+
+        faces = data.get('faces', None)
         if faces is not None:
             assert faces.dim() == 3, 'Only support batch operation'
 
+        # get operators
+        L = data.get('L', None)
+        evals = data.get('evals', None)
+        evecs = data.get('evecs', None)
+        gradX = data.get('GX', None)
+        gradY = data.get('GY', None)
+
+        # get descriptors
+        hks = data.get('hks', None)
+        wks = data.get('wks', None)
+        x = None
+        if self.input_type == 'hks':
+            x = hks
+        elif self.input_type == 'wks':
+            x = wks
+        elif self.input_type == 'xyz':
+            x = verts
+
         # ensure reproducibility to first convert to cpu to find the precomputed spectral ops
-        if faces is not None:
-            _, mass, L, evals, evecs, gradX, gradY = get_all_operators(verts.cpu(), faces.cpu(), k=self.k_eig,
-                                                                       cache_dir=self.cache_dir)
-        else:
-            _, mass, L, evals, evecs, gradX, gradY = get_all_operators(verts.cpu(), None, k=self.k_eig,
-                                                                       cache_dir=self.cache_dir)
-        mass = mass.to(device=verts.device)
-        L = L.to(device=verts.device)
-        evals = evals.to(device=verts.device)
-        evecs = evecs.to(device=verts.device)
-        gradX = gradX.to(device=verts.device)
-        gradY = gradY.to(device=verts.device)
+        #if faces is not None:
+        #    _, mass, L, evals, evecs, gradX, gradY = get_all_operators(verts.cpu(), faces.cpu(), k=self.k_eig,
+        #                                                               cache_dir=self.cache_dir)
+        #else:
+        #    _, mass, L, evals, evecs, gradX, gradY = get_all_operators(verts.cpu(), None, k=self.k_eig,
+        #                                                               cache_dir=self.cache_dir)
+        #mass = mass.to(device=verts.device)
+        #L = L.to(device=verts.device)
+        #evals = evals.to(device=verts.device)
+        #evecs = evecs.to(device=verts.device)
+        #gradX = gradX.to(device=verts.device)
+        #gradY = gradY.to(device=verts.device)
 
         # Compute hks when necessary
-        if feats is not None:
-            x = feats
-        else:
-            if self.input_type == 'hks':
-                x = compute_hks_autoscale(evals, evecs)
-            elif self.input_type == 'wks':
-                x = compute_wks_autoscale(evals, evecs, mass)
-            elif self.input_type == 'xyz':
-                x = verts
+        #if feats is not None:
+        #    x = feats
+        #else:
+        #    if self.input_type == 'hks':
+        #        x = compute_hks_autoscale(evals, evecs)
+        #    elif self.input_type == 'wks':
+        #        x = compute_wks_autoscale(evals, evecs, mass)
+        #    elif self.input_type == 'xyz':
+        #        x = verts
 
         # Apply the first linear layer
         x = self.first_linear(x)

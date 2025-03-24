@@ -1,9 +1,18 @@
 import torch
 import torch.nn as nn
 from torch_geometric.nn import EdgeConv
+from torch_geometric.utils import to_torch_sparse_tensor
 
 from utils.registry import NETWORK_REGISTRY
 
+def dense_to_sparse(edge_index, N):
+    # Create sparse adjacency matrix
+    values = torch.ones(edge_index.size(1), device=edge_index.device)
+    adj = torch.sparse_coo_tensor(
+        edge_index, values, 
+        size=(N, N)
+    )
+    return adj
 
 # Resnet Blocks
 class ResnetBlockFC(nn.Module):
@@ -91,7 +100,8 @@ class ResnetECPos(torch.nn.Module):
 
         self.actvn = torch.nn.ReLU()
         self.pool = maxpool
-
+    
+    #@torch.compile(dynamic=True)
     def forward(self, verts, faces, feats=None):
         squeeze = False
         if verts.dim() == 3:
@@ -101,28 +111,31 @@ class ResnetECPos(torch.nn.Module):
             squeeze = True
         edge_index = get_edge_index(faces)
         p = verts if feats is None else feats
+        # Convert to sparse representation
+        adj = to_torch_sparse_tensor(edge_index)
         net = self.fc_pos(p)
-        net = self.block_0(net, edge_index)
+        net = self.block_0(net, adj)
 
         pooled = self.pool(net, dim=1, keepdim=True).expand(net.size())
         net = torch.cat([net, pooled, p], dim=1)
 
-        net = self.block_1(net, edge_index)
+        net = self.block_1(net, adj)
         pooled = self.pool(net, dim=1, keepdim=True).expand(net.size())
         net = torch.cat([net, pooled, p], dim=1)
 
-        net = self.block_2(net, edge_index)
+        net = self.block_2(net, adj)
         pooled = self.pool(net, dim=1, keepdim=True).expand(net.size())
         net = torch.cat([net, pooled, p], dim=1)
 
-        net = self.block_3(net, edge_index)
+        net = self.block_3(net, adj)
         pooled = self.pool(net, dim=1, keepdim=True).expand(net.size())
         net = torch.cat([net, pooled, p], dim=1)
 
-        net = self.block_4(net, edge_index)
+        net = self.block_4(net, adj)
 
         c = self.fc_c(self.actvn(net))
 
         if squeeze:
             c = c.unsqueeze(0)
+        
         return c

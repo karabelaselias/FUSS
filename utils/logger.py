@@ -90,8 +90,8 @@ class MessageLogger:
     @master_only
     def __call__(self, log_dict):
         """
-        Logging message
-
+        Logging message using wandb instead of tensorboard
+        
         Args:
             log_dict (dict): logging dictionary with the following keys:
                 epoch (int): Current epoch.
@@ -104,13 +104,13 @@ class MessageLogger:
         epoch = log_dict.pop('epoch')
         current_iter = log_dict.pop('iter')
         lrs = log_dict.pop('lrs')
-
+    
         # format message
         message = (f'[{self.exp_name[:5]}..][epoch:{epoch:3d}, iter:{current_iter:8,d}, lr:(')
         for v in lrs:
             message += f'{v:.3e},'
         message += ')]'
-
+    
         # time and estimated time
         if 'time' in log_dict.keys():
             iter_time = log_dict.pop('time')
@@ -125,27 +125,106 @@ class MessageLogger:
             eta_str = str(datetime.timedelta(seconds=int(eta_sec)))
             message += f'[eta: {eta_str}, '
             message += f'time (data): {iter_time:.3f} ({data_time:.3f})]'
-
-        # other items, for example losses
+    
+        # prepare wandb logs
+        wandb_logs = {
+            'epoch': epoch,
+            'iter': current_iter,
+        }
+        # Add learning rates
+        for i, lr in enumerate(lrs):
+            wandb_logs[f'lr_{i}'] = lr
+        
+        # Add time metrics
+        if 'time' in locals():
+            wandb_logs['time'] = iter_time
+            wandb_logs['data_time'] = data_time
+        
+        # Other items, for example losses
         for k, v in log_dict.items():
             message += f'{k}: {v:.4e} '
-            # add to tensorboard logger
-            if self.tb_logger:
-                # loss starts with "l_"
-                if k.startswith('l_'):
-                    self.tb_logger.add_scalar(f'losses/{k}', v, current_iter)
-                else:
-                    self.tb_logger.add_scalar(k, v, current_iter)
-
+            # Add to wandb logs
+            wandb_logs[k] = v
+    
+        # Log to wandb
+        if self.tb_logger:  # Now 'tb_logger' is actually wandb
+            self.tb_logger.log(wandb_logs, step=current_iter)
+    
         # print message
         self.logger.info(message)
 
+
+@master_only
+def log_mesh(logger, tag, vertices, faces, global_step=None, colors=None):
+    """Log mesh to wandb
+    
+    Args:
+        logger: wandb logger
+        tag (str): Name for the mesh visualization
+        vertices (tensor): Mesh vertices
+        faces (tensor): Mesh faces
+        global_step (int, optional): Global step value
+        colors (tensor, optional): Colors for the mesh
+    """
+    # Skip if logger is None
+    if logger is None:
+        return
+        
+    # For wandb, convert tensors to numpy
+    from utils.tensor_util import to_numpy
+    
+    vertices_np = to_numpy(vertices)
+    faces_np = to_numpy(faces)
+    
+    # Create wandb 3D object
+    data = {
+        "type": "mesh",
+        "vertices": vertices_np,
+        "faces": faces_np
+    }
+    
+    if colors is not None:
+        colors_np = to_numpy(colors)
+        data["colors"] = colors_np
+        
+    # Log to wandb
+    logger.log({tag: logger.Object3D(data)}, step=global_step)
 
 @master_only
 def init_tb_logger(log_dir):
     from torch.utils.tensorboard import SummaryWriter
     tb_logger = SummaryWriter(log_dir=log_dir)
     return tb_logger
+
+# 2. Modify the logger.py to add wandb integration
+# Add to utils/logger.py
+@master_only
+def init_wandb_logger(opt):
+    """Initialize wandb logger.
+    
+    Args:
+        opt (dict): Config dict containing wandb settings.
+        
+    Returns:
+        wandb object.
+    """
+    import wandb
+    
+    project_name = opt.get('wandb', {}).get('project', opt['name'])
+    wandb_dir = opt.get('wandb', {}).get('dir', opt['path']['log'])
+    resume_id = opt.get('wandb', {}).get('resume_id', None)
+    entity = opt.get('wandb', {}).get('entity', 'karabelaselias-university-of-graz')
+    
+    wandb.init(
+        project=project_name,
+        name=f"{project_name}_{datetime.datetime.now():%Y%m%d_%H%M%S}",
+        entity = entity,
+        id=resume_id,
+        dir=wandb_dir,
+        config=opt,
+        resume="allow" if resume_id else None
+    )
+    return wandb
 
 
 def get_root_logger(logger_name='root_logger', log_file=None, log_level=logging.INFO):
@@ -202,11 +281,11 @@ def get_env_info():
     Currently, only log the software version.
     """
     import torch
-    import torchvision
+    #import torchvision
     import platform
 
     msg = ('\nVersion Information: '
            f'\n\tPython: {platform.python_version()}'
-           f'\n\tPyTorch: {torch.__version__}'
-           f'\n\tTorchVision: {torchvision.__version__}')
+           f'\n\tPyTorch: {torch.__version__}')
+           #f'\n\tTorchVision: {torchvision.__version__}')
     return msg

@@ -36,6 +36,10 @@ if __name__ == '__main__':
     off_files = sorted(glob(os.path.join(data_root, 'off', '*.off')))
     assert len(off_files) != 0
 
+    # create a seperate folder with the scaled meshes
+    scaled_off_path = os.path.join(data_root, 'off_scaled')
+    os.makedirs(scaled_off_path, exist_ok=True)
+    
     # read mesh info file
     header = ['file_name', 'mean_x', 'mean_y', 'mean_z', 'face_area']
     with open(os.path.join(data_root, 'mesh_info.csv'), 'w+', encoding='UTF8') as f:
@@ -47,21 +51,25 @@ if __name__ == '__main__':
             filename = os.path.basename(off_file)
 
             if not no_normalize:
-                # center shape
-                verts_mean = np.mean(verts, axis=0)
+
+                # calculate scaled mesh
+                verts_mean = np.mean(verts, axis=-2, keepdims=True)
                 verts -= verts_mean
-
-                # normalize verts by sqrt face area
-                old_sqrt_area = laplacian_decomposition(verts=verts, faces=faces, k=1)[-1]
-                print(f'Old face sqrt area: {old_sqrt_area:.3f}')
-                verts /= old_sqrt_area
-
+                
+                coords = verts[faces]
+                vec_A = coords[:, 1, :] - coords[:, 0, :]
+                vec_B = coords[:, 2, :] - coords[:, 0, :]
+                face_areas = np.linalg.norm(np.cross(vec_A, vec_B, axis=-1), axis=1) * 0.5
+                total_area = np.sum(face_areas)
+                scale = np.sqrt(total_area)
+                verts = verts / scale
+                
                 # save new verts and faces
-                write_off(off_file, verts, faces)
+                scaled_file = os.path.join(scaled_off_path, filename)
+                write_off(scaled_file, verts, faces)
 
                 # write mesh info
-                data = [filename[:-4], verts_mean[0], verts_mean[1], verts_mean[2],
-                        old_sqrt_area]
+                data = [filename[:-4], verts_mean[0,0], verts_mean[0,1], verts_mean[0,2], scale]
                 writer.writerow(data)
 
             if not no_eig:

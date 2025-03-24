@@ -5,6 +5,7 @@ import os.path as osp
 import random
 import hashlib
 import numpy as np
+import pyamg
 
 import scipy
 import scipy.spatial
@@ -37,7 +38,7 @@ def sparse_np_to_torch(A):
     values = Acoo.data
     indices = np.vstack((Acoo.row, Acoo.col))
     shape = Acoo.shape
-    return torch.sparse_coo_tensor(torch.LongTensor(indices), torch.FloatTensor(values), torch.Size(shape)).coalesce()
+    return torch.sparse_coo_tensor(torch.LongTensor(indices).contiguous(), torch.FloatTensor(values).contiguous(), torch.Size(shape)).coalesce()
 
 
 def sparse_torch_to_np(A):
@@ -60,9 +61,12 @@ def to_basis(feat, basis, massvec):
     Returns:
         coef (torch.Tensor): coefficient of basis [B, K, C]
     """
-    basis_t = basis.transpose(-2, -1)
-    coef = torch.matmul(basis_t, feat * massvec.unsqueeze(-1))
-    return coef
+    # Do the multiplication with mass first to save memory
+    weighted_feat = feat * massvec.unsqueeze(-1)  # This is in-place friendly
+    #basis_t = basis.transpose(-2, -1)
+    return torch.bmm(basis.mT, weighted_feat)
+    #coef = torch.matmul(basis_t, feat * massvec.unsqueeze(-1))
+    #return coef
 
 
 def from_basis(coef, basis):
@@ -74,7 +78,7 @@ def from_basis(coef, basis):
     Returns:
         feat (torch.Tensor): feature vector [B, V, C]
     """
-    feat = torch.matmul(basis, coef)
+    feat = torch.bmm(basis, coef)
     return feat
 
 
@@ -594,6 +598,9 @@ def compute_operators(verts, faces, k=120, normals=None):
     if k > 0:
         # Prepare matrices
         L_eigsh = (L + eps * scipy.sparse.identity(L.shape[0])).tocsc()
+        #B = np.ones((L_eigsh.shape[0], 1))
+        #ml = pyamg.smoothed_aggregation_solver(L_eigsh,B)
+        #Mp = ml.aspreconditioner()
         massvec_eigsh = massvec_np
         Mmat = scipy.sparse.diags(massvec_eigsh)
         eigs_sigma = eps
@@ -601,6 +608,12 @@ def compute_operators(verts, faces, k=120, normals=None):
         fail_cnt = 0
         while True:
             try:
+                # compute eigenvalues and eigenvectors with LOBPCG
+                # initial approximation to the K eigenvectors
+                rng = np.random.default_rng(seed=42)
+                X = rng.standard_normal((L_eigsh.shape[0], k))
+                # preconditioner based on ml    
+                #evals_np, evecs_np = sla.lobpcg(L_eigsh, X, M=Mp, B=Mmat, largest=False, maxiter=200)
                 evals_np, evecs_np = sla.eigsh(L_eigsh, k=k, M=Mmat, sigma=eigs_sigma)
                 # Clip off any eigenvalues that end up slightly negative due to numerical error
                 evals_np = np.clip(evals_np, a_min=0., a_max=float('inf'))
@@ -757,7 +770,7 @@ def get_operators(verts, faces, k=120, normals=None,
                 gradY_shape=gradY_np.shape,
             )
 
-    return frames, mass, L, evals, evecs, gradX, gradY
+    return frames.contiguous(), mass.contiguous(), L, evals.contiguous(), evecs.contiguous(), gradX, gradY
 
 
 def get_all_operators(verts, faces, k=120,
@@ -818,8 +831,21 @@ def compute_hks_autoscale(evals, evecs, count=16):
     Returns:
         out (torch.Tensor): heat kernel signature [B, V, count]
     """
+    
     scales = torch.logspace(-2.0, 0.0, steps=count, device=evals.device, dtype=evals.dtype)
 
+    # expand batch
+    if len(evals.shape) == 1:
+        expand_batch = True
+        evals = evals.unsqueeze(0)
+        evecs = evecs.unsqueeze(0)
+        scales = scales.unsqueeze(0)
+    else:
+        expand_batch = False
+    
+    print(evals.unsqueeze(1).shape)
+    print(scales.unsqueeze(-1).shape)
+    
     power_coefs = torch.exp(-evals.unsqueeze(1) * scales.unsqueeze(-1)).unsqueeze(1) # [B, 1, S, K]
     terms = power_coefs * (evecs * evecs).unsqueeze(2) # [B, V, S, K]
 
@@ -910,3 +936,167 @@ def data_augmentation(verts, rot_x=0, rot_y=90.0, rot_z=0, std=0.01, noise_clip=
     verts = verts * scale.to(verts.device)
 
     return verts
+
+def HKS(evals, evects, time_list,scaled=False):
+    """
+    Returns the Heat Kernel Signature for num_T different values.
+    The values of the time are interpolated in logscale between the limits
+    given in the HKS paper. These limits only depends on the eigenvalues.
+
+    Parameters
+    ------------------------
+    evals     : (K,) array of the K eigenvalues
+    evecs     : (N,K) array with the K eigenvectors
+    time_list : (num_T,) Time values to use
+    scaled    : (bool) whether to scale for each time value
+
+    Output
+    ------------------------
+    HKS : (N,num_T) array where each line is the HKS for a given t
+    """
+    evals_s = np.asarray(evals).flatten()
+    t_list = np.asarray(time_list).flatten()
+
+    coefs = np.exp(-np.outer(t_list, evals_s))  # (num_T,K)
+    # weighted_evects = evects[None, :, :] * coefs[:, None,:]  # (num_T,N,K)
+    # natural_HKS = np.einsum('tnk,nk->nt', weighted_evects, evects)
+    natural_HKS = np.einsum('tk,nk,nk->nt', coefs, evects, evects)
+
+    if scaled:
+        inv_scaling = coefs.sum(1)  # (num_T)
+        return (1/inv_scaling)[None,:] * natural_HKS
+
+    return natural_HKS
+
+def auto_HKS(evals, evects, num_T, scaled=True):
+    """
+    Compute HKS with an automatic choice of tile values
+
+    Parameters
+    ------------------------
+    evals       : (K,) array of  K eigenvalues
+    evects      : (N,K) array with K eigenvectors
+    landmarks   : (p,) if not None, indices of landmarks to compute.
+    num_T       : (int) number values of t to use
+    Output
+    ------------------------
+    HKS or lm_HKS : (N,num_E) or (N,p*num_E)  array where each column is the WKS for a given e
+                    for some landmark
+    """
+
+    abs_ev = sorted(np.abs(evals))
+    t_list = np.geomspace(4*np.log(10)/abs_ev[-1], 4*np.log(10)/abs_ev[1], num_T)
+
+    return HKS(abs_ev, evects, t_list, scaled=scaled)
+
+def compute_hks(evecs, evals, mass, n_descr=128, subsample_step=1, n_eig=128, normalize=True):
+    """
+    Compute Heat Kernel Signature (HKS) descriptors.
+    
+    Args:
+        evecs: (N, K) eigenvectors of the Laplace-Beltrami operator
+        evals: (K,) eigenvalues of the Laplace-Beltrami operator
+        mass: (N,) vertex masses
+        n_descr: (int) number of descriptors
+        subsample_step: (int) subsampling step
+        n_eig: (int) number of eigenvectors to use
+    
+    Returns:
+        feats: (N, n_descr) HKS descriptors
+    """
+    feats = auto_HKS(evals[:n_eig], evecs[:, :n_eig], n_descr, scaled=True)
+    feats = feats[:, np.arange(0, feats.shape[1], subsample_step)]
+    if normalize:
+        feats_norm2 = np.einsum('np,n->p', feats**2, mass).flatten()
+        feats /= np.sqrt(feats_norm2)[None, :]
+    return feats.astype(np.float32)
+
+def WKS(evals, evects, energy_list, sigma, scaled=False):
+    """
+    Returns the Wave Kernel Signature for some energy values.
+
+    Parameters
+    ------------------------
+    evects      : (N,K) array with the K eigenvectors of the Laplace Beltrami operator
+    evals       : (K,) array of the K corresponding eigenvalues
+    energy_list : (num_E,) values of e to use
+    sigma       : (float) [positive] standard deviation to use
+    scaled      : (bool) Whether to scale each energy level
+
+    Output
+    ------------------------
+    WKS : (N,num_E) array where each column is the WKS for a given e
+    """
+    assert sigma > 0, f"Sigma should be positive ! Given value : {sigma}"
+
+    evals = np.asarray(evals).flatten()
+    indices = np.where(evals > 1e-5)[0].flatten()
+    evals = evals[indices]
+    evects = evects[:, indices]
+
+    e_list = np.asarray(energy_list)
+    coefs = np.exp(-np.square(e_list[:,None] - np.log(np.abs(evals))[None,:])/(2*sigma**2))  # (num_E,K)
+
+    # weighted_evects = evects[None, :, :] * coefs[:,None, :]  # (num_E,N,K)
+
+    # natural_WKS = np.einsum('tnk,nk->nt', weighted_evects, evects)  # (N,num_E)
+    natural_WKS = np.einsum('tk,nk,nk->nt', coefs, evects, evects)
+
+    if scaled:
+        inv_scaling = coefs.sum(1)  # (num_E)
+        return (1/inv_scaling)[None,:] * natural_WKS
+    
+    return natural_WKS
+
+def auto_WKS(evals, evects, num_E, landmarks=None, scaled=True):
+    """
+    Compute WKS with an automatic choice of scale and energy
+
+    Parameters
+    ------------------------
+    evals       : (K,) array of  K eigenvalues
+    evects      : (N,K) array with K eigenvectors
+    landmarks   : (p,) If not None, indices of landmarks to compute.
+    num_E       : (int) number values of e to use
+    Output
+    ------------------------
+    WKS or lm_WKS : (N,num_E) or (N,p*num_E)  array where each column is the WKS for a given e
+                    and possibly for some landmarks
+    """
+    abs_ev = sorted(np.abs(evals))
+
+    e_min,e_max = np.log(abs_ev[1]),np.log(abs_ev[-1])
+    sigma = 7*(e_max-e_min)/num_E
+
+    e_min += 2*sigma
+    e_max -= 2*sigma
+
+    energy_list = np.linspace(e_min,e_max,num_E)
+
+    
+    return WKS(abs_ev, evects, energy_list, sigma, scaled=scaled)
+
+def compute_wks(evecs, evals, mass, n_descr=128, subsample_step=1, n_eig=128, normalize=True):
+    """
+    Compute Wave Kernel Signature (WKS) descriptors.
+
+    Args:
+        evecs: (N, K) eigenvectors of the Laplace-Beltrami operator
+        evals: (K,) eigenvalues of the Laplace-Beltrami operator
+        mass: (N,) vertex masses
+        n_descr: (int) number of descriptors
+        subsample_step: (int) subsampling step
+        n_eig: (int) number of eigenvectors to use
+    
+    Returns:
+        feats: (N, n_descr) WKS descriptors
+    """
+    feats = auto_WKS(evals[:n_eig], evecs[:, :n_eig], n_descr, scaled=True)
+    feats = feats[:, np.arange(0, feats.shape[1], subsample_step)]
+    # print("wks_shape",feats.shape, mass.shape)
+    if normalize:
+        feats_norm2 = np.einsum('np,n->p', feats**2, mass).flatten()
+        feats /= np.sqrt(feats_norm2)[None, :]
+    # feats_norm2 = np.einsum('np,n->p', feats**2, mass).flatten()
+    # feats /= np.sqrt(feats_norm2)[None, :]
+    return feats.astype(np.float32)

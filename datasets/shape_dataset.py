@@ -9,9 +9,9 @@ import torch
 from torch.utils.data import Dataset
 
 from utils.shape_util import read_shape
-from utils.geometry_util import get_operators
+from utils.geometry_util import get_operators, compute_hks, compute_wks, torch2np
 from utils.registry import DATASET_REGISTRY
-
+from itertools import permutations
 
 def sort_list(l):
     try:
@@ -21,17 +21,19 @@ def sort_list(l):
 
 
 def get_spectral_ops(item, num_evecs, cache_dir=None):
-    _, mass, L, evals, evecs, _, _ = get_operators(item['verts'], item.get('faces'),
+    _, mass, L, evals, evecs, gradX, gradY = get_operators(item['verts'], item.get('faces'),
                                                    k=num_evecs,
                                                    cache_dir=cache_dir)
-
     evecs_trans = evecs.T * mass[None]
     item['evecs'] = evecs[:, :num_evecs]
     item['evecs_trans'] = evecs_trans[:num_evecs]
-    item['evals'] = evals[:num_evecs]
+    item['evals'] =  evals[:num_evecs]
     item['mass'] = mass
-    item['L'] = L.to_dense()
-
+    item['L'] = L
+    item['GX'] = gradX
+    item['GY'] = gradY
+    item['hks'] = torch.from_numpy(compute_hks(torch2np(evecs), torch2np(evals), torch2np(mass), n_descr=16, n_eig=num_evecs)).float().contiguous()
+    item['wks'] = torch.from_numpy(compute_wks(torch2np(evecs), torch2np(evals), torch2np(mass), n_descr=128, n_eig=num_evecs)).float().contiguous()
 
     return item
 
@@ -68,26 +70,27 @@ class SingleShapeDataset(Dataset):
 
     def _init_data(self):
         # check the data path contains .off files
-        off_path = os.path.join(self.data_root, 'off')
+        off_path = os.path.join(self.data_root, 'off_scaled')
         assert os.path.isdir(off_path), f'Invalid path {off_path} not containing .off files'
         self.off_files = sort_list(glob(f'{off_path}/*.off'))
-
+        
         # check if mesh info file exists
         self.mesh_info_file = os.path.join(self.data_root, 'mesh_info.csv')
         assert os.path.isfile(self.mesh_info_file), f'Invalid file {self.mesh_info_file}'
 
     def __getitem__(self, index):
         item = dict()
-
+        
         # get vertices
         off_file = self.off_files[index]
+
         basename = os.path.splitext(os.path.basename(off_file))[0]
         item['name'] = basename
         item['index'] = index
         verts, faces = read_shape(off_file)
-        item['verts'] = torch.from_numpy(verts).float()
+        item['verts'] = torch.from_numpy(verts).float().contiguous()
         if self.return_faces:
-            item['faces'] = torch.from_numpy(faces).long()
+            item['faces'] = torch.from_numpy(faces).long().contiguous()
 
         # get eigenfunctions/eigenvalues
         if self.return_evecs:
@@ -119,7 +122,8 @@ class PairShapeDataset(Dataset):
         if n_combination is not None:
             self.combinations = [(i, j) for i in range(len(dataset)) for j in random.sample(range(len(dataset)), n_combination)]
         else:
-            self.combinations = list(product(range(len(dataset)), repeat=2))
+            self.combinations = list(permutations(range(len(dataset)), 2)) #list(product(range(len(dataset)), repeat=2))
+        
         self.num_shapes = num_shapes
 
     def __getitem__(self, index):
@@ -162,3 +166,26 @@ class PairPancreasDataset(PairShapeDataset):
                                         return_faces, return_evecs, num_evecs)
         super(PairPancreasDataset, self).__init__(dataset, n_combination)
 
+
+@DATASET_REGISTRY.register()
+class SingleAtriaDataset(SingleShapeDataset):
+    def __init__(self, data_root,
+                 phase, start_index, end_index,
+                 return_faces=True, return_evecs=True, num_evecs=120):
+        super(SingleAtriaDataset, self).__init__(data_root, return_faces,
+                                                 return_evecs, num_evecs)
+        assert phase in ['train', 'test', 'full'], f'Invalid phase {phase}, only "train" or "test" or "full"'
+        assert len(self) == 70, f'Pancreas dataset should contain 70 shapes, but get {len(self)}.'
+
+        if self.off_files:
+            self.off_files = self.off_files[start_index:end_index]
+        self._size = end_index - start_index
+
+@DATASET_REGISTRY.register()
+class PairAtriaDataset(PairShapeDataset):
+    def __init__(self, data_root,
+                 phase,  start_index, end_index, n_combination=None,
+                 return_faces=True, return_evecs=True, num_evecs=120):
+        dataset = SingleAtriaDataset(data_root, phase, start_index, end_index,
+                                        return_faces, return_evecs, num_evecs)
+        super(PairAtriaDataset, self).__init__(dataset, n_combination)

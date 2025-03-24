@@ -1,15 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-
-from torch_scatter import scatter_max
 from typing import Optional, Dict, Tuple
-from utils.registry import NETWORK_REGISTRY
+import math
+from torch_scatter import scatter_max
 
-
-@NETWORK_REGISTRY.register()
-class SparseSimilarity(nn.Module):
+class A100OptimizedSparseSimilarity(nn.Module):
     """Ultra-optimized sparse similarity implementation for A100 GPUs
     
     Args:
@@ -20,19 +16,16 @@ class SparseSimilarity(nn.Module):
         hard: Whether to use hard assignment (one-hot) instead of soft assignment
         use_half: Whether to use half precision (FP16) for computations
     """
-    def __init__(self, tau=0.05, k_neighbors=10, chunk_size=4096, streams=2, hard=False, use_half=True, respect_global_amp=False):
-        super(SparseSimilarity, self).__init__()
+    def __init__(self, tau=0.05, k_neighbors=10, chunk_size=4096, streams=2, hard=False, use_half=True):
+        super(A100OptimizedSparseSimilarity, self).__init__()
         self.tau = tau
         self.k_neighbors = k_neighbors
-        #self.k_backup = k_neighbors
+        self.k_backup = k_neighbors
         self.base_chunk_size = chunk_size
         self.streams = streams
         self.hard = hard
         self.use_half = use_half
         self.use_streams = streams > 1 and not self.hard
-        
-        # Use this flag to determine if we need our own precision control
-        self.force_precision_control = not respect_global_amp
         
         # Enable TF32 for A100
         self._original_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -86,6 +79,9 @@ class SparseSimilarity(nn.Module):
         """
         # Ensure input is 3D with batch size 1
         assert feat_x.dim() == 3 and feat_x.size(0) == 1, "Input must be [1, Nx, C]"
+
+        if self.hard == True:
+            self.k_neighbors = 1
         
         if feat_y is None:
             return self._process_similarity_matrix(feat_x)
@@ -97,9 +93,10 @@ class SparseSimilarity(nn.Module):
         feat_y = feat_y.contiguous()
         
         # Normalize features with mixed precision
-        feat_x = F.normalize(feat_x, dim=-1, p=2)
-        feat_y = F.normalize(feat_y, dim=-1, p=2)
-    
+        with torch.amp.autocast(device_type='cuda', enabled=self.use_half):
+            feat_x = F.normalize(feat_x, dim=-1, p=2)
+            feat_y = F.normalize(feat_y, dim=-1, p=2)
+        
         n_x = feat_x.shape[1]
         n_y = feat_y.shape[1]
         feat_dim = feat_x.shape[2]
@@ -108,8 +105,7 @@ class SparseSimilarity(nn.Module):
         # Pre-allocate outputs with optimized dtype
         max_elements = n_x * self.k_neighbors
         indices = torch.empty((2, max_elements), dtype=torch.int32, device=device)
-        #values = torch.empty(max_elements, dtype=torch.float16 if self.use_half else torch.float32, device=device)
-        values = torch.empty(max_elements, device=device)
+        values = torch.empty(max_elements, dtype=torch.float16 if self.use_half else torch.float32, device=device)
         
         # Get optimal chunk size
         chunk_size = self._aligned_chunk_size(n_x)
@@ -129,15 +125,14 @@ class SparseSimilarity(nn.Module):
             feat_x_chunk = feat_x[0, start_idx:end_idx]  # [chunk, C]
             
             # Compute similarity with tensor core optimization
-            
-            # Process as 2D matrices 
-            feat_x_2d = feat_x_chunk  # [chunk, C]
-            feat_y_2d = feat_y[0]  # [n_y, C]
-            
-            # Use optimized matmul for A100 tensor cores
-            with torch.amp.autocast(device_type='cuda', enabled=self.force_precision_control and self.use_half):
+            with torch.amp.autocast(device_type='cuda', enabled=self.use_half):
+                # Process as 2D matrices 
+                feat_x_2d = feat_x_chunk  # [chunk, C]
+                feat_y_2d = feat_y[0]  # [n_y, C]
+                
+                # Use optimized matmul for A100 tensor cores
                 similarity = torch.matmul(feat_x_2d, feat_y_2d.transpose(-2, -1))  # [chunk, n_y]
-        
+            
             # Find top-k with A100 optimization
             top_values, top_indices = self._optimized_topk(similarity)
             
@@ -167,7 +162,9 @@ class SparseSimilarity(nn.Module):
         
         # Apply hard assignment if needed
         if self.hard:
-            return self._convert_to_hard_assignment(sparse_tensor)
+            self.k_neighbors = self.k_backup
+            #return self._convert_to_hard_assignment_sparse(sparse_tensor)
+            #return self._convert_to_hard_assignment(sparse_tensor)
         
         return sparse_tensor.to_sparse_csr()
     
@@ -215,13 +212,12 @@ class SparseSimilarity(nn.Module):
                     feat_x_chunk = feat_x[0, start_idx:end_idx].contiguous()
                     
                     # Compute similarity with tensor core optimization
-                    
-                    # Process as 2D matrices 
-                    feat_x_2d = feat_x_chunk  # [chunk, C]
-                    feat_y_2d = feat_y[0]  # [n_y, C]
-                    
-                    # Use optimized matmul for A100 tensor cores
-                    with torch.amp.autocast(device_type='cuda', enabled=self.force_precision_control and self.use_half):
+                    with torch.amp.autocast(device_type='cuda', enabled=self.use_half):
+                        # Process as 2D matrices 
+                        feat_x_2d = feat_x_chunk  # [chunk, C]
+                        feat_y_2d = feat_y[0]  # [n_y, C]
+                        
+                        # Use optimized matmul for A100 tensor cores
                         similarity = torch.matmul(feat_x_2d, feat_y_2d.transpose(-2, -1))  # [chunk, n_y]
                     
                     # Find top-k with A100 optimization
@@ -257,7 +253,9 @@ class SparseSimilarity(nn.Module):
         
         # Apply hard assignment if needed
         if self.hard:
-            return self._convert_to_hard_assignment(sparse_tensor)
+            self.k_neighbors = self.k_backup
+            #return self._convert_to_hard_assignment_sparse(sparse_tensor)
+            #return self._convert_to_hard_assignment(sparse_tensor)
         
         return sparse_tensor.to_sparse_csr()
     
@@ -271,11 +269,12 @@ class SparseSimilarity(nn.Module):
             similarity = similarity.contiguous()
         
         # Use FP16 for topk computation which is faster on A100
-        with torch.amp.autocast(device_type='cuda', enabled=self.force_precision_control and self.use_half):
+        with torch.amp.autocast(device_type='cuda', enabled=self.use_half):
             # Find top-k values and indices
             topk_values, topk_indices = torch.topk(
                 similarity, k=self.k_neighbors, dim=1, sorted=False
-            )     
+            )
+            
             # Apply softmax with FP16 precision for better tensor core utilization
             topk_softmax = F.softmax(topk_values, dim=1)
         
@@ -333,10 +332,114 @@ class SparseSimilarity(nn.Module):
         
         # Apply hard assignment if needed
         if self.hard:
-            return self._convert_to_hard_assignment(sparse_tensor)
+            self.k_neighbors = self.k_backup
+            #return self._convert_to_hard_assignment_sparse(sparse_tensor)
+            #return self._convert_to_hard_assignment(sparse_tensor)
         
         return sparse_tensor.to_sparse_csr()
-
+    
+    def _convert_to_hard_assignment_sparse(self, sparse_tensor):
+        """Fast GPU-based hard assignment that avoids memory explosion
+        
+        This method:
+        1. Uses sorting and grouping for efficient batch processing
+        2. Stays entirely on GPU
+        3. Minimizes Python loop overhead
+        4. Preserves gradient flow
+        
+        Args:
+            sparse_tensor: Input sparse tensor
+            
+        Returns:
+            Sparse tensor with hard assignment (one-hot)
+        """
+        indices = sparse_tensor.indices()
+        values = sparse_tensor.values()
+        n_x, n_y = sparse_tensor.size()
+        device = sparse_tensor.device
+        
+        # Sort by row to group indices
+        perm = torch.argsort(indices[0])
+        sorted_indices = indices[:, perm]
+        sorted_values = values[perm]
+        
+        # Find row boundaries
+        rows = sorted_indices[0]
+        row_boundaries = torch.cat([
+            torch.tensor([0], device=device),
+            torch.nonzero(rows[1:] != rows[:-1]).reshape(-1) + 1,
+            torch.tensor([rows.shape[0]], device=device)
+        ])
+        
+        # Pre-allocate result arrays with estimated size
+        est_size = min(indices.shape[1] // 10 + 1000, n_x)  # Estimate number of unique rows
+        row_indices = torch.zeros(est_size, dtype=torch.int32, device=device)
+        col_indices = torch.zeros(est_size, dtype=torch.int32, device=device)
+        max_values = torch.zeros(est_size, device=device)
+        max_orig_indices = torch.zeros(est_size, dtype=torch.int32, device=device)
+        
+        # Process row groups
+        count = 0
+        for i in range(len(row_boundaries) - 1):
+            start_idx = row_boundaries[i]
+            end_idx = row_boundaries[i+1]
+            
+            if start_idx == end_idx:
+                continue
+                
+            # Get values for this row
+            row_vals = sorted_values[start_idx:end_idx]
+            
+            # Find max value
+            max_idx = row_vals.argmax() + start_idx
+            
+            # Store result
+            if count >= est_size:
+                # Resize arrays if needed
+                new_size = est_size * 2
+                row_indices = torch.cat([row_indices, torch.zeros(est_size, dtype=torch.int32, device=device)])
+                col_indices = torch.cat([col_indices, torch.zeros(est_size, dtype=torch.int32, device=device)])
+                max_values = torch.cat([max_values, torch.zeros(est_size, device=device)])
+                max_orig_indices = torch.cat([max_orig_indices, torch.zeros(est_size, dtype=torch.int32, device=device)])
+                est_size = new_size
+                
+            row_indices[count] = sorted_indices[0, max_idx]
+            col_indices[count] = sorted_indices[1, max_idx]
+            max_values[count] = sorted_values[max_idx]
+            max_orig_indices[count] = perm[max_idx]  # Store original index
+            count += 1
+        
+        # Trim to actual size
+        row_indices = row_indices[:count]
+        col_indices = col_indices[:count]
+        max_values = max_values[:count]
+        max_orig_indices = max_orig_indices[:count]
+        
+        # Create mask for max entries
+        keep_mask = torch.zeros_like(values, dtype=torch.bool)
+        keep_mask[max_orig_indices] = True
+        
+        # Create hard assignment with straight-through estimator
+        hard_values = torch.zeros_like(values)
+        hard_values[keep_mask] = 1.0
+        final_values = hard_values - values.detach() + values
+        
+        # Create result with only maximal values
+        new_indices = torch.stack([row_indices, col_indices])
+        new_values = torch.ones_like(max_values)  # Use ones for hard assignment
+        
+        # Add straight-through estimator for gradient flow
+        new_values = new_values - max_values.detach() + max_values
+        
+        result = torch.sparse_coo_tensor(
+            new_indices,
+            new_values,
+            (n_x, n_y),
+            device=device
+        ).coalesce()
+        
+        return result.to_sparse_csr()
+    
     def _convert_to_hard_assignment(self, sparse_tensor):
         """A100-optimized hard assignment conversion with better gradient flow"""
         indices = sparse_tensor.indices()

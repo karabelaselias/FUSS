@@ -1,3 +1,7 @@
+#import os
+#os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'debug:1'
+#os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
+
 import datetime
 import sys
 import math
@@ -11,14 +15,20 @@ from datasets.data_sampler import EnlargedSampler
 
 from models import build_model
 from utils import (AvgTimer, MessageLogger, get_env_info, get_root_logger,
-                   init_tb_logger)
+                   init_tb_logger, init_wandb_logger)
 from utils.options import dict2str, parse_options
 
+import torch.autograd.profiler as profiler
 
+#def init_tb_loggers(opt):
+#    tb_logger = init_tb_logger(opt['path']['experiments_root'])
+#    return tb_logger
+
+# Modify init_tb_loggers function in train.py
 def init_tb_loggers(opt):
-    tb_logger = init_tb_logger(opt['path']['experiments_root'])
-    return tb_logger
-
+    # Initialize wandb logger instead of tensorboard
+    wandb_logger = init_wandb_logger(opt)
+    return wandb_logger
 
 def create_train_val_dataloader(opt, logger):
     train_set, val_set = None, None
@@ -96,7 +106,7 @@ def train_pipeline(root_path):
 
     # training
     logger.info(f'Start training from epoch: {model.curr_epoch}, iter: {model.curr_iter}')
-    data_timer, iter_timer = AvgTimer(), AvgTimer()
+    data_timer, iter_timer, backward_timer = AvgTimer(), AvgTimer(), AvgTimer()
     start_time = time.time()
 
     try:
@@ -107,25 +117,34 @@ def train_pipeline(root_path):
                 data_timer.record()
 
                 model.curr_iter += 1
-
-                # process data and forward pass
+                # Process data and forward/backward pass with profiling
+                
                 model.feed_data(train_data)
-                # backward pass
+                backward_timer.start()
                 model.optimize_parameters()
-                # update model per iteration
+                backward_timer.record()
                 model.update_model_per_iteration()
-
+            
                 iter_timer.record()
                 if model.curr_iter == 1:
                     # reset start time in msg_logger for more accurate eta_time
                     # not work in resume mode
                     msg_logger.reset_start_time()
+                
                 # log
                 if model.curr_iter % opt['logger']['print_freq'] == 0:
                     log_vars = {'epoch': model.curr_epoch, 'iter': model.curr_iter}
                     log_vars.update({'lrs': model.get_current_learning_rate()})
-                    log_vars.update({'time': iter_timer.get_avg_time(), 'data_time': data_timer.get_avg_time()})
+                    # Add timing information
+                    log_vars.update({
+                        'time': iter_timer.get_avg_time(), 
+                        'data_time': data_timer.get_avg_time(),
+                        'backward_time': backward_timer.get_avg_time()
+                    })
                     log_vars.update(model.get_loss_metrics())
+                    # Add network timing metrics
+                    log_vars.update(model.get_timing_metrics())
+                    
                     msg_logger(log_vars)
 
                 # save models and training states
