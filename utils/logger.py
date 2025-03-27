@@ -4,6 +4,7 @@ import logging
 import time
 
 from .dist_util import get_dist_info, master_only
+from .tensor_util import to_numpy
 
 # initialized logger
 initialized_logger = {}
@@ -153,9 +154,159 @@ class MessageLogger:
         # print message
         self.logger.info(message)
 
-
 @master_only
 def log_mesh(logger, tag, vertices, faces, global_step=None, colors=None):
+    """Log mesh to wandb using Plotly with improved visualization settings
+    
+    Args:
+        logger: wandb logger
+        tag (str): Name for the mesh visualization
+        vertices (tensor/array): Mesh vertices
+        faces (tensor/array): Mesh faces
+        global_step (int, optional): Global step value
+        colors (tensor/array, optional): Colors for the mesh
+    """
+    # Skip if logger is None
+    if logger is None:
+        return
+        
+    try:
+        import numpy as np
+        import plotly.graph_objects as go
+        from utils.tensor_util import to_numpy
+        
+        # Convert tensors to numpy
+        vertices_np = to_numpy(vertices)
+        faces_np = to_numpy(faces)
+        
+        # Ensure vertices are shaped correctly [N, 3]
+        if vertices_np.ndim == 3 and vertices_np.shape[0] == 1:
+            vertices_np = vertices_np.squeeze(0)
+        
+        # Ensure faces are shaped correctly [N, 3] 
+        if faces_np.ndim == 3 and faces_np.shape[0] == 1:
+            faces_np = faces_np.squeeze(0)
+            
+        # Create color values based on vertex height for better visualization
+        if colors is None:
+            # Use height (z-coordinate) for coloring
+            z_vals = vertices_np[:, 2]
+            min_z, max_z = np.min(z_vals), np.max(z_vals)
+            colors = (z_vals - min_z) / (max_z - min_z + 1e-8)
+            
+        # Extract coordinates for Plotly
+        x, y, z = vertices_np[:, 0], vertices_np[:, 1], vertices_np[:, 2]
+        i, j, k = faces_np[:, 0], faces_np[:, 1], faces_np[:, 2]
+        
+        # Create the 3D mesh with improved visualization settings
+        fig = go.Figure()
+        
+        # Add the filled mesh with a soft color palette
+        fig.add_trace(go.Mesh3d(
+            x=x, y=y, z=z,
+            i=i, j=j, k=k,
+            intensity=colors,
+            colorscale='Blues',  # Use a nicer colorscale - try 'Blues', 'RdBu', or 'Cividis'
+            opacity=1.0,         # Slightly transparent to see structure
+            lighting=dict(
+                ambient=0.6,      # Higher ambient light
+                diffuse=0.5,      # Moderate diffuse
+                roughness=0.2,    # Some roughness
+                specular=0.3,     # Moderate specular
+                fresnel=0.01       # No fresnel
+            ),
+            flatshading=True,    # Try smooth shading
+            hoverinfo='none',
+            showscale=False       # Hide the color scale
+        ))
+        
+        # Add mesh edges (wireframe) as line segments
+        edges = set()
+        for face in faces_np:
+            # Add edges for each face, ensuring each edge is only added once
+            edges.add(tuple(sorted([int(face[0]), int(face[1])])))
+            edges.add(tuple(sorted([int(face[1]), int(face[2])])))
+            edges.add(tuple(sorted([int(face[2]), int(face[0])])))
+        
+        # Create edge line segments
+        edge_x = []
+        edge_y = []
+        edge_z = []
+        
+        for edge in edges:
+            # Add the first vertex
+            edge_x.append(vertices_np[edge[0], 0])
+            edge_y.append(vertices_np[edge[0], 1])
+            edge_z.append(vertices_np[edge[0], 2])
+            
+            # Add the second vertex
+            edge_x.append(vertices_np[edge[1], 0])
+            edge_y.append(vertices_np[edge[1], 1])
+            edge_z.append(vertices_np[edge[1], 2])
+            
+            # Add None to create separation between edges
+            edge_x.append(None)
+            edge_y.append(None)
+            edge_z.append(None)
+        
+        # Add the edges as a scatter3d trace
+        fig.add_trace(go.Scatter3d(
+            x=edge_x,
+            y=edge_y,
+            z=edge_z,
+            mode='lines',
+            line=dict(
+                color='black',
+                width=1.5
+            ),
+            hoverinfo='none'
+        ))
+        
+        # Enhanced layout settings
+        fig.update_layout(
+            scene=dict(
+                aspectmode='cube',  # Equal aspect ratio
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.5),  # Better camera position
+                    up=dict(x=0, y=0, z=1)          # Camera up direction
+                ),
+                xaxis=dict(showticklabels=False, showgrid=False, zeroline=False, visible=False),
+                yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, visible=False),
+                zaxis=dict(showticklabels=False, showgrid=False, zeroline=False, visible=False),
+                dragmode='turntable'  # Makes rotation more intuitive
+            ),
+            margin=dict(l=0, r=0, t=35, b=0),
+            title=dict(
+                text=tag,
+                x=0.5,
+                y=0.95,
+                font=dict(size=16)
+            ),
+            paper_bgcolor='rgba(0,0,0,0)',  # Transparent background
+            plot_bgcolor='rgba(0,0,0,0)',
+            width=500,                      # Fixed width for better display in Wandb
+            height=500                      # Fixed height for better display
+        )
+        
+        # Log to wandb with a namespace for validation metrics to avoid step conflicts
+        validation_tag = f"validation/{tag}"
+        validation_step = global_step if global_step is not None else 0
+        
+        # Log both the visualization and the step
+        logger.log({
+            validation_tag: fig,
+            "validation_step": validation_step
+        }, step=None)  # Don't pass the step parameter here
+        
+    except ImportError as e:
+        print(f"Warning: Missing import: {e}. Install with 'pip install plotly numpy' for mesh visualization.")
+    except Exception as e:
+        print(f"Warning: Failed to log mesh visualization: {e}")
+        # Fallback: Just log the shape information
+        logger.log({f"{tag}_info": f"Vertices: {vertices.shape}, Faces: {faces.shape}"}, step=global_step)
+
+@master_only
+def log_mesh_old(logger, tag, vertices, faces, global_step=None, colors=None):
     """Log mesh to wandb
     
     Args:
@@ -224,6 +375,9 @@ def init_wandb_logger(opt):
         config=opt,
         resume="allow" if resume_id else None
     )
+    # Define custom step metrics to handle out-of-order logging
+    if wandb.run is not None:
+        wandb.define_metric("validation/*", step_metric="validation_step")
     return wandb
 
 

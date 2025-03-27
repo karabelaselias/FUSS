@@ -116,7 +116,7 @@ def build_dataloader(dataset, dataset_opt, phase, num_gpu=1, dist=False, sampler
             num_workers = dataset_opt['num_worker']
         else:  # non-distributed training
             batch_size = dataset_opt['batch_size']
-            num_workers = 1 #dataset_opt['num_worker']
+            num_workers = dataset_opt['num_worker']
         dataloader_args = dict(
             dataset=dataset,
             batch_size=1,
@@ -139,12 +139,41 @@ def build_dataloader(dataset, dataset_opt, phase, num_gpu=1, dist=False, sampler
     return torch.utils.data.DataLoader(**dataloader_args)
 
 def collate_shape_batch(batch):
+    """Collate batch of shape data efficiently"""
+    collated = {}
+    
+    # Process each top-level key only once
+    for top_key in batch[0].keys():
+        collated[top_key] = {}
+        inner_keys = batch[0][top_key].keys()
+        
+        # Group keys by type to avoid repeated prefix checks
+        sparse_keys = [k for k in inner_keys if k.startswith('L') or k.startswith('G')]
+        index_keys = [k for k in inner_keys if k.startswith('index') or k.startswith('face_')]
+        name_keys = [k for k in inner_keys if k.startswith('name')]
+        dense_keys = [k for k in inner_keys if k not in sparse_keys + index_keys + name_keys]
+        
+        # Process each key type efficiently
+        for k in sparse_keys:
+            collated[top_key][k] = [b[top_key][k] for b in batch]
+            
+        for k in index_keys:
+            collated[top_key][k] = torch.tensor([b[top_key][k] for b in batch])
+            
+        for k in name_keys:
+            collated[top_key][k] = [b[top_key][k] for b in batch]
+            
+        for k in dense_keys:
+            collated[top_key][k] = torch.stack([b[top_key][k] for b in batch])
+    
+    return collated
+
+def collate_shape_batch_old(batch):
     """Collate batch of shape data
 
        entries will be a dict
     
-    """
-    
+    """   
     collated = {}
 
     # First get all top-level keys (item1, item2, etc)

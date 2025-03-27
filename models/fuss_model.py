@@ -12,7 +12,7 @@ from utils.tensor_util import to_device, to_numpy, transfer_batch_to_device
 from utils.tensor_util import to_device, to_numpy
 #from networks.permutation_network import apply_sparse_similarity, compute_permutation_matrix_sparse
 #from networks.permutation_network import SparseSimilarity
-from utils.fmap_util import fmap2pointmap
+from utils.fmap_util import fmap2pointmap_keops
 from utils.torch_sparse_mm import sparse_mm
 import gc
 
@@ -173,13 +173,37 @@ class FussModel(BaseModel):
                                                                       vert_y, face_x, face_y)
 
     def compute_chamfer_distance(self, vert_x, vert_y, face_x, face_y):
+        # Check and fix NaN/Inf values
+        if torch.isnan(vert_x).any() or torch.isinf(vert_x).any():
+            logger = get_root_logger()
+            logger.warning("NaN or Inf detected in vert_x, replacing with safe values")
+            vert_x = torch.nan_to_num(vert_x, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        if torch.isnan(vert_y).any() or torch.isinf(vert_y).any():
+            logger = get_root_logger()
+            logger.warning("NaN or Inf detected in vert_y, replacing with safe values")
+            vert_y = torch.nan_to_num(vert_y, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         mesh_x = Meshes(verts=[vert_x], faces=[face_x])
         mesh_y = Meshes(verts=[vert_y], faces=[face_y])
 
-        sample_x = sample_points_from_meshes(mesh_x, 20000)
-        sample_y = sample_points_from_meshes(mesh_y, 20000)
+        # Sample points with error handling
+        try:
+            sample_x = sample_points_from_meshes(mesh_x, 20000)
+            sample_y = sample_points_from_meshes(mesh_y, 20000)
+        except ValueError as e:
+            logger = get_root_logger()
+            logger.error(f"Error during point sampling: {e}")
+            # Return a zero loss as fallback
+            return torch.tensor(0.0, device=vert_x.device, dtype=vert_x.dtype)
 
         loss_chamfer = self.losses['chamfer_shape_loss'](sample_x, sample_y)
+        # Check for NaN loss
+        if torch.isnan(loss_chamfer) or torch.isinf(loss_chamfer):
+            logger = get_root_logger()
+            logger.warning("NaN or Inf detected in chamfer loss, replacing with zero")
+            loss_chamfer = torch.tensor(0.0, device=vert_x.device, dtype=vert_x.dtype)
+        
         return loss_chamfer
 
     def compute_shape_edge_loss(self, vert_x_pred_arr, vert_y_pred_arr, face_x, face_y):
@@ -252,9 +276,18 @@ class FussModel(BaseModel):
         displacements = torch.zeros(size=(inputs.shape[0], inputs.shape[1], 3), device=self.device)
         for i in range(inputs.shape[0]):
             displacements[i] = self.networks['interpolator'](inputs[i].unsqueeze(0), face_x.unsqueeze(0)).squeeze(0)
-    
-        vert_x_pred_arr = vert_x.unsqueeze(0) + displacements * time_steps
+
+        # Add gradient clipping to prevent extreme values
+        displacements = torch.clamp(displacements, min=-100.0, max=100.0)
+        # Stable computation for interpolation
+        vert_x_pred_arr = vert_x.unsqueeze(0) + torch.clamp(displacements * time_steps, min=-100.0, max=100.0)
         vert_x_pred_arr = vert_x_pred_arr.permute([1, 2, 0]).contiguous()
+
+        # Check for NaN/Inf
+        if torch.isnan(vert_x_pred_arr).any() or torch.isinf(vert_x_pred_arr).any():
+            logger = get_root_logger()
+            logger.warning("NaN or Inf detected in interpolated vertices, replacing with safe values")
+            vert_x_pred_arr = torch.nan_to_num(vert_x_pred_arr, nan=0.0, posinf=1e6, neginf=-1e6)
     
         return vert_x_pred_arr
 
@@ -382,29 +415,28 @@ class FussModel(BaseModel):
         feat_x = self.networks['feature_extractor'](data_x)
         feat_y = self.networks['feature_extractor'](data_y)
 
-        Pxy, Pyx = self.compute_permutation_matrix(feat_x, feat_y, bidirectional=True)
+        Pxy_sparse, Pyx_sparse = self.compute_permutation_matrix(feat_x, feat_y, bidirectional=True)
 
-        temp_y = sparse_mm(Pxy, evecs_y) #apply_sparse_similarity(Pxy, evecs_y)
-        temp_x = sparse_mm(Pyx, evecs_x) #apply_sparse_similarity(Pyx, evecs_x)
-
+        temp_y = sparse_mm(Pxy_sparse, evecs_y) #apply_sparse_similarity(Pxy, evecs_y)
+        temp_x = sparse_mm(Pyx_sparse, evecs_x) #apply_sparse_similarity(Pyx, evecs_x)
         Cxy = evecs_trans_y @ temp_x #(Pyx @ evecs_x)
         Cyx = evecs_trans_x @ temp_y #(Pxy @ evecs_y)
         
         # convert functional map to point-to-point map
-        p2p_yx = fmap2pointmap(Cxy, evecs_x, evecs_y)
-        p2p_xy = fmap2pointmap(Cyx, evecs_y, evecs_x)
+        p2p_yx = fmap2pointmap_keops(Cxy, evecs_x, evecs_y)
+        p2p_xy = fmap2pointmap_keops(Cyx, evecs_y, evecs_x)
 
         if tb_logger is not None:
             # [n_vert_x, 3, T+1]
             vert_x_pred_arr = self.compute_displacement(vert_x.squeeze(0), vert_y.squeeze(0),
-                                                        face_x.squeeze(0), Pxy, p2p_xy)
+                                                        face_x.squeeze(0), Pxy_sparse, p2p_xy)
             # [n_vert_y, 3, T+1]
             vert_y_pred_arr = self.compute_displacement(vert_y.squeeze(0), vert_x.squeeze(0),
-                                                        face_y.squeeze(0), Pyx, p2p_yx)
+                                                        face_y.squeeze(0), Pyx_sparse, p2p_yx)
 
         # compute Pyx from functional map
         Cxy = evecs_trans_y @ evecs_x[p2p_yx]
-        Pyx = evecs_y @ Cxy @ evecs_trans_x
+        #Pyx = evecs_y @ Cxy @ evecs_trans_x
 
         # finish record
         timer.record()
@@ -440,8 +472,10 @@ class FussModel(BaseModel):
                 log_mesh(tb_logger, f'{index}/{i + 1}', vertices=point_pred, faces=face_x, global_step=step)
                 #tb_logger.add_mesh(f'{index}/{i + 1}', vertices=point_pred, faces=face_x,
                 #                   global_step=step)
-
-        return p2p_yx, Pyx, Cxy
+        # Return p2p_yx, spectral components (evecs_y, Cxy, evecs_trans_x), and Cxy
+        spectral_components = (evecs_y, Cxy, evecs_trans_x)
+        
+        return p2p_yx, spectral_components, Cxy
 
     @torch.no_grad()
     def get_loss_between_shapes(self, data):
@@ -490,7 +524,7 @@ class FussModel(BaseModel):
         temp_tx = sparse_mm(Ptx, evecs_x.squeeze(0))
         Cxt = evecs_trans_t @ temp_tx.unsqueeze(0) #(Ptx @ evecs_x)
         # convert functional map to point-to-point map
-        p2p_tx = fmap2pointmap(Cxt, evecs_x, evecs_t)
+        p2p_tx = fmap2pointmap_keops(Cxt, evecs_x, evecs_t)
 
         # from template to shape x
         vert_x_pred_arr = self.compute_displacement(vert_t, vert_x, face_t, None, p2p_tx)

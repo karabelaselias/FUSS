@@ -2,16 +2,106 @@ import os
 import numpy as np
 import open3d as o3d
 
-
-def write_obj_pair(file_name1, file_name2, verts1, faces1, verts2, faces2, Pyx, texture_file):
-    # write off for shape 1
+def write_obj_pair(file_name1, file_name2, verts1, faces1, verts2, faces2, 
+                spectral_map=None, texture_file=None):
+    """
+    Write a pair of 3D meshes with texture mapping between them.
+    
+    Args:
+        file_name1 (str): Output file path for the first mesh
+        file_name2 (str): Output file path for the second mesh
+        verts1 (numpy.ndarray): Vertices of the first mesh [N, 3]
+        faces1 (numpy.ndarray): Faces of the first mesh [F, 3]
+        verts2 (numpy.ndarray): Vertices of the second mesh [M, 3]
+        faces2 (numpy.ndarray): Faces of the second mesh [G, 3]
+        spectral_map (tuple or tensor): Either:
+            - Tuple of (evecs_y, Cxy, evecs_trans_x) for memory-efficient mapping calculation
+            - Direct p2p indices tensor
+            - Sparse permutation matrix
+            - Dense permutation matrix
+        texture_file (str): Texture file name
+    """
+    # Convert tensors to numpy if needed
+    if isinstance(verts1, torch.Tensor):
+        verts1 = verts1.detach().cpu().numpy()
+    if isinstance(faces1, torch.Tensor):
+        faces1 = faces1.detach().cpu().numpy()
+    if isinstance(verts2, torch.Tensor):
+        verts2 = verts2.detach().cpu().numpy()
+    if isinstance(faces2, torch.Tensor):
+        faces2 = faces2.detach().cpu().numpy()
+    
+    # Generate texture coordinates for shape 1
     uv1 = generate_tex_coords(verts1)
+    
+    # Write obj for shape 1 if it doesn't exist
     if not os.path.exists(file_name1):
         write_obj_with_texture(verts1, faces1, file_name1, uv1, texture_file)
-
-    # write off for shape 2
-    uv2 = Pyx @ uv1
+    
+    # Map texture coords from shape 1 to shape 2 using the appropriate method
+    if spectral_map is None:
+        # Default identity mapping
+        uv2 = uv1
+    elif isinstance(spectral_map, tuple) and len(spectral_map) == 3:
+        # Memory-efficient spectral mapping
+        evecs_y, Cxy, evecs_trans_x = spectral_map
+        
+        # We need to compute: uv2 = Pyx @ uv1 where Pyx = evecs_y @ Cxy @ evecs_trans_x
+        # Implement it step by step to avoid materializing the full Pyx matrix
+        
+        # First convert tensors to numpy for consistent processing
+        if isinstance(evecs_y, torch.Tensor):
+            evecs_y = evecs_y.detach().cpu().numpy()
+        if isinstance(Cxy, torch.Tensor):
+            Cxy = Cxy.detach().cpu().numpy()
+        if isinstance(evecs_trans_x, torch.Tensor):
+            evecs_trans_x = evecs_trans_x.detach().cpu().numpy()
+            
+        # Compute matrix multiplication in steps to avoid forming full dense matrix
+        # (evecs_trans_x @ uv1) -> (Cxy @ result) -> (evecs_y @ result)
+        temp = evecs_trans_x @ uv1
+        temp = Cxy @ temp
+        uv2 = evecs_y @ temp
+    elif isinstance(spectral_map, torch.Tensor):
+        if spectral_map.dim() == 1:  # p2p indices
+            uv2 = uv1[spectral_map.detach().cpu().numpy()]
+        elif spectral_map.is_sparse:  # sparse tensor
+            # Convert to CPU for numpy operations
+            spectral_map_cpu = spectral_map.detach().cpu()
+            # Use sparse matrix multiplication
+            if spectral_map_cpu.layout == torch.sparse_coo:
+                from scipy.sparse import coo_matrix
+                indices = spectral_map_cpu.indices().numpy()
+                values = spectral_map_cpu.values().numpy()
+                sparse_scipy = coo_matrix((values, (indices[0], indices[1])), shape=spectral_map_cpu.shape)
+                uv2 = sparse_scipy.dot(uv1)
+            elif spectral_map_cpu.layout == torch.sparse_csr:
+                from scipy.sparse import csr_matrix
+                crow_indices = spectral_map_cpu.crow_indices().numpy()
+                col_indices = spectral_map_cpu.col_indices().numpy()
+                values = spectral_map_cpu.values().numpy()
+                sparse_scipy = csr_matrix((values, col_indices, crow_indices), shape=spectral_map_cpu.shape)
+                uv2 = sparse_scipy.dot(uv1)
+            else:
+                raise ValueError(f"Unsupported sparse layout: {spectral_map_cpu.layout}")
+        else:  # dense tensor
+            spectral_map_np = spectral_map.detach().cpu().numpy()
+            uv2 = spectral_map_np @ uv1
+    else:  # numpy array
+        uv2 = spectral_map @ uv1
+    
+    # Write obj for shape 2
     write_obj_with_texture(verts2, faces2, file_name2, uv2, texture_file)
+
+#def write_obj_pair(file_name1, file_name2, verts1, faces1, verts2, faces2, Pyx, texture_file):
+#    # write off for shape 1
+#    uv1 = generate_tex_coords(verts1)
+#    if not os.path.exists(file_name1):
+#        write_obj_with_texture(verts1, faces1, file_name1, uv1, texture_file)
+
+#    # write off for shape 2
+#    uv2 = Pyx @ uv1
+#    write_obj_with_texture(verts2, faces2, file_name2, uv2, texture_file)
 
 
 def generate_tex_coords(verts, col1=1, col2=0, mult_const=1):

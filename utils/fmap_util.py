@@ -1,8 +1,15 @@
 import numpy as np
 import scipy.spatial
-
 import torch
+from densemaps.torch import maps
 
+def keops_nn(feat_x, feat_y, blur=None):
+    """Optimized FAISS GPU implementation with PyTorch tensor support"""
+    feat_x = feat_x.contiguous()
+    feat_y = feat_y.contiguous()
+    P21 = maps.KernelDistMap(feat_x, feat_y, blur)  # A "dense" kernel map, not used in memory
+    p2p_21 = P21.get_nn()  # I can get the (N2,) vertex to vertex map
+    return p2p_21
 
 def nn_query(feat_x, feat_y, dim=-2):
     """
@@ -73,6 +80,21 @@ def knn_graph(x, k, loop=False, flow='source_to_target'):
         row, col = row[mask], col[mask]
     return torch.stack([row, col], dim=0)
 
+
+def fmap2pointmap_keops(C12, evecs_x, evecs_y):
+    """
+    Convert functional map to point-to-point map
+
+    Args:
+        C12: functional map (shape x->shape y). Shape [K, K]
+        evecs_x: eigenvectors of shape x. Shape [V1, K]
+        evecs_y: eigenvectors of shape y. Shape [V2, K]
+    Returns:
+        p2p: point-to-point map (shape y -> shape x). [V2]
+    """
+    feat_1 = torch.matmul(evecs_x, C12.t())
+    return keops_nn(feat_1, evecs_y)
+    #return nn_query(torch.matmul(evecs_x, C12.t()), evecs_y)
 
 def fmap2pointmap(C12, evecs_x, evecs_y):
     """

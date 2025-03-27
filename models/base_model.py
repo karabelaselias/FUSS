@@ -165,7 +165,7 @@ class BaseModel:
     @torch.no_grad()
     def validation(self, dataloader, tb_logger, update=True):
         """Validation function.
-
+    
         Args:
             dataloader (torch.utils.data.DataLoader): Validation dataloader.
             tb_logger (tensorboard logger): Tensorboard logger.
@@ -174,17 +174,21 @@ class BaseModel:
         # Always disable autocast for validation
         with torch.amp.autocast(device_type=self.device.type, enabled=False):
             self.eval()
-
+    
         # save results
         metrics_result = {}
-
+    
         # one iteration
         timer = AvgTimer()
         pbar = tqdm(dataloader)
         for index, data in enumerate(pbar):
-            p2p, Pyx, Cxy = self.validate_single(data, timer, tb_logger, index)
-            p2p, Pyx, Cxy = to_numpy(p2p), to_numpy(Pyx), to_numpy(Cxy)
-
+            # The function now returns p2p, spectral_components (for memory-efficient matrix mult), and Cxy
+            p2p, spectral_components, Cxy = self.validate_single(data, timer, tb_logger, index)
+            p2p, Cxy = to_numpy(p2p), to_numpy(Cxy)
+            # Convert spectral components to numpy for visualization
+            evecs_y, Cxy_comp, evecs_trans_x = spectral_components
+            spectral_components_np = (to_numpy(evecs_y), to_numpy(Cxy_comp), to_numpy(evecs_trans_x))
+    
             # visualize results
             if self.opt.get('visualize', False):
                 data_x, data_y = data['first'], data['second']
@@ -197,19 +201,20 @@ class BaseModel:
                     faces_x, faces_y = to_numpy(data_x['faces']), to_numpy(data_y['faces'])
                     file_x = os.path.join(self.opt['path']['visualization'], f'{name_x}.obj')
                     file_y = os.path.join(self.opt['path']['visualization'], f'{name_x}-{name_y}.obj')
-                    write_obj_pair(file_x, file_y, verts_x, faces_x, verts_y, faces_y, Pyx, 'texture.png')
+                    write_obj_pair(file_x, file_y, verts_x, faces_x, verts_y, faces_y, 
+                                   spectral_components_np, 'texture.png')
                 else:
                     file_x = os.path.join(self.opt['path']['visualization'], f'{name_x}.ply')
                     file_y = os.path.join(self.opt['path']['visualization'], f'{name_y}-{name_x}.ply')
                     write_point_cloud_pair(file_x, file_y, verts_x, verts_y, p2p)
-
+    
                 # save functional map and point-wise correspondences
                 save_dict = {'Cxy': Cxy, 'p2p': p2p + 1}  # plus one for MATLAB
                 sio.savemat(os.path.join(self.opt['path']['visualization'], f'{name_x}-{name_y}.mat'), save_dict)
-
+    
         logger = get_root_logger()
         logger.info(f'Avg time: {timer.get_avg_time():.4f}')
-
+    
         # train mode
         self.train()
 
