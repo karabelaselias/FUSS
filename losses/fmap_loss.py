@@ -78,8 +78,8 @@ class SURFMNetLoss(nn.Module):
 
         # Orthogonality penalty
         if self.w_orth > 0:
-            orthogonality_loss = criterion(torch.bmm(C12.transpose(1, 2), C12), eye_batch) + \
-                                 criterion(torch.bmm(C21.transpose(1, 2), C21), eye_batch)
+            orthogonality_loss = criterion(torch.bmm(C12.mT, C12), eye_batch) + \
+                                 criterion(torch.bmm(C21.mT, C21), eye_batch)
             orthogonality_loss *= self.w_orth
             losses['l_orth'] = orthogonality_loss
 

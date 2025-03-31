@@ -717,11 +717,11 @@ def get_operators(verts, faces, k=120, normals=None,
                 gradX = read_sp_mat('gradX')
                 gradY = read_sp_mat('gradY')
 
-                frames = torch.from_numpy(frames).to(device=device, dtype=dtype)
-                mass = torch.from_numpy(mass).to(device=device, dtype=dtype)
+                frames = torch.from_numpy(frames).to(device=device, dtype=dtype, memory_format=torch.contiguous_format)
+                mass = torch.from_numpy(mass).to(device=device, dtype=dtype, memory_format=torch.contiguous_format)
                 L = sparse_np_to_torch(L).to(device=device, dtype=dtype)
-                evals = torch.from_numpy(evals).to(device=device, dtype=dtype)
-                evecs = torch.from_numpy(evecs).to(device=device, dtype=dtype)
+                evals = torch.from_numpy(evals).to(device=device, dtype=dtype, memory_format=torch.contiguous_format)
+                evecs = torch.from_numpy(evecs).to(device=device, dtype=dtype, memory_format=torch.contiguous_format)
                 gradX = sparse_np_to_torch(gradX).to(device=device, dtype=dtype)
                 gradY = sparse_np_to_torch(gradY).to(device=device, dtype=dtype)
 

@@ -14,6 +14,8 @@ from utils.tensor_util import to_device, to_numpy
 #from networks.permutation_network import SparseSimilarity
 from utils.fmap_util import fmap2pointmap_keops
 from utils.torch_sparse_mm import sparse_mm
+from utils.amp_utils import disable_amp
+
 import gc
 
 
@@ -105,6 +107,8 @@ class FussModel(BaseModel):
             #Pyx.pull_back(vert_x_pred_arr[:, :, self.pose_timestep])
             #Pyx @ vert_x_pred_arr[:, :, self.pose_timestep]
             self.compute_alignment_loss(vert_x, vert_y, vert_x_1, vert_y_1)
+
+            del vert_x_1, vert_y_1
     
             # compute smoothness regularisation for point map
             if 'smoothness_loss' in self.losses:
@@ -119,8 +123,9 @@ class FussModel(BaseModel):
     
                 # compute symmetry loss
                 self.compute_symmetry_loss(shape_x_diff_arr, shape_y_diff_arr)
+                del shape_x_diff_arr, shape_y_diff_arr
     
-            #del Pxy, Pyx
+            del Pxy, Pyx
             
             # shape deformation losses
             if 'dirichlet_shape_loss' in self.losses:
@@ -128,14 +133,16 @@ class FussModel(BaseModel):
                 self.compute_shape_interpolation_dirichlet_loss(vert_x, vert_x_pred_arr, Lx)
                 self.compute_shape_interpolation_dirichlet_loss(vert_y, vert_y_pred_arr, Ly)
     
-            if 'chamfer_shape_loss' in self.losses:
+            if 'chamfer_shape_loss' or 'earth_mover_loss' in self.losses:
                 self.compute_shape_interpolation_chamfer_loss(vert_x, vert_x_pred_arr, vert_y, vert_y_pred_arr,
                                                               face_x, face_y)
-    
+
             if 'edge_shape_loss' in self.losses:
                 self.compute_shape_edge_loss(vert_x_pred_arr, vert_y_pred_arr, face_x, face_y)
             
             self.network_timers['loss_stuff'].record()
+
+            del vert_x_pred_arr, vert_y_pred_arr 
 
         
 
@@ -171,7 +178,24 @@ class FussModel(BaseModel):
 
             self.loss_metrics['l_cd'] += self.compute_chamfer_distance(vert_x_pred_arr[:, :, self.pose_timestep],
                                                                       vert_y, face_x, face_y)
+        elif 'earth_mover_loss' in self.losses:
+            if 'l_emd' not in self.loss_metrics:
+                self.loss_metrics['l_emd'] = 0.0
 
+            if self.pose_timestep > 0:
+                for tp in range(self.pose_timestep + 1):
+                    self.loss_metrics['l_emd'] += self.compute_earth_mover_distance(vert_x_pred_arr[:, :, tp],
+                                                                              vert_y_pred_arr[:, :, self.pose_timestep - tp])
+            # shape X to vert_y[:, :, T] & shape Y to vert_x[:, :, T]
+            self.loss_metrics['l_emd'] += self.compute_earth_mover_distance(vert_x, vert_y_pred_arr[:, :, self.pose_timestep])
+
+            self.loss_metrics['l_emd'] += self.compute_earth_mover_distance(vert_x_pred_arr[:, :, self.pose_timestep], vert_y)
+            
+
+    def compute_earth_mover_distance(self, vert_x, vert_y):
+        loss_emd = self.losses['earth_mover_loss'](vert_x, vert_y)
+        return loss_emd
+        
     def compute_chamfer_distance(self, vert_x, vert_y, face_x, face_y):
         # Check and fix NaN/Inf values
         if torch.isnan(vert_x).any() or torch.isinf(vert_x).any():
@@ -229,66 +253,105 @@ class FussModel(BaseModel):
             return Pxy, Pyx
 
         return Pxy
-       
-    def compute_displacement(self, vert_x, vert_y, face_x, Pxy=None, p2p_xy=None):
-        """Compute displacement field from shape x to shape y.
+
+    # Memory-optimized compute_displacement implementation
+    def compute_displacement(self,vert_x, vert_y, face_x, Pxy=None, p2p_xy=None):
+        n_vert_x = vert_x.shape[0]
         
-        Args:
-            vert_x: Vertices of shape x [n_vert_x, 3]
-            vert_y: Vertices of shape y [n_vert_y, 3]
-            face_x: Faces of shape x [n_face_x, 3]
-            Pxy: Permutation matrix or (scores, indices) tuple from x to y
-            p2p_xy: Point-to-point map indices
+        # Align vertices
+        if p2p_xy is not None:
+            vert_y_align = vert_y[p2p_xy]
+        elif Pxy is not None:
+            vert_y_align = sparse_mm(Pxy, vert_y)
+        else:
+            raise ValueError("Either Pxy or p2p_xy must be provided")
+        
+        # Calculate displacement vector
+        displacement_vector = vert_y_align - vert_x
+        
+        # Initialize output tensor
+        vert_x_pred_arr = torch.zeros(n_vert_x, 3, self.pose_timestep + 1, device=self.device)
+        
+        # Process each timestep individually
+        for t_idx in range(self.pose_timestep + 1):
+            # Calculate time value 
+            t = (t_idx + 1) / (self.pose_timestep + 1)
             
-        Note:
-            If p2p_xy is provided, it is used directly.
-            Otherwise, Pxy is used to compute the alignment.
-        """
-        n_vert_x, n_vert_y = vert_x.shape[0], vert_y.shape[0]
+            # Create input tensor
+            base_input = torch.cat((
+                vert_x, 
+                displacement_vector,
+                torch.zeros(size=(n_vert_x, 1), device=self.device)
+            ), dim=1)
+            
+            # Create time tensor to match original behavior
+            time_tensor = torch.zeros_like(base_input)
+            time_tensor[:, -1] = t
+            
+            # Add time component
+            t_input = base_input + time_tensor
+            
+            # Process through network
+            t_displacement = self.networks['interpolator'](
+                t_input.unsqueeze(0), face_x.unsqueeze(0)
+            ).squeeze(0)
+            
+            # Apply clipping
+            t_displacement = torch.clamp(t_displacement, min=-100.0, max=100.0)
+            
+            # Calculate vertices at this time step
+            vert_x_pred_arr[:, :, t_idx] = vert_x + torch.clamp(t_displacement * t, min=-100.0, max=100.0)
+        
+        return vert_x_pred_arr
     
-        # Efficiently compute time steps (can be pre-computed once)
+    def compute_displacement_inefficient(self, vert_x, vert_y, face_x, Pxy=None, p2p_xy=None):
+        """Compute displacement field from shape x to shape y."""
+        n_vert_x = vert_x.shape[0]
+        
+        # Pre-compute time steps once
         step_size = 1 / (self.pose_timestep + 1)
         time_steps = step_size + torch.arange(0, 1, step_size, device=self.device).unsqueeze(1).unsqueeze(2)
         time_mask = torch.zeros(7, device=self.device)
         time_mask[-1] = 1.0
         time_steps_up = time_steps * time_mask.unsqueeze(0).unsqueeze(1)
         
-        # Determine how to align vertices - maintain original logic
+        # Align vertices - same as original
         if p2p_xy is not None:
-            # Use point-to-point map directly
             vert_y_align = vert_y[p2p_xy]
         elif Pxy is not None:
-            # Use permutation matrix
-            #vert_y_align = apply_sparse_similarity(Pxy, vert_y.unsqueeze(0))
             vert_y_align = sparse_mm(Pxy, vert_y)
-            #print(vert_y_align.shape)
         else:
             raise ValueError("Either Pxy or p2p_xy must be provided")
         
-        # Rest of the function remains the same
+        # Create inputs - same as original
         inputs = torch.cat((
             vert_x, vert_y_align - vert_x,
             torch.zeros(size=(n_vert_x, 1), device=self.device)
         ), dim=1).unsqueeze(0)
         inputs = inputs + time_steps_up
-    
-        # [n_vert_x, 3, T+1]
+        
+        # Identical to original processing
         displacements = torch.zeros(size=(inputs.shape[0], inputs.shape[1], 3), device=self.device)
         for i in range(inputs.shape[0]):
+            # Add explicit cleanup every 10,000 vertices
+            if i % 10000 == 0:
+                torch.cuda.empty_cache()
             displacements[i] = self.networks['interpolator'](inputs[i].unsqueeze(0), face_x.unsqueeze(0)).squeeze(0)
-
-        # Add gradient clipping to prevent extreme values
+        
+        # Same operations as original
         displacements = torch.clamp(displacements, min=-100.0, max=100.0)
-        # Stable computation for interpolation
         vert_x_pred_arr = vert_x.unsqueeze(0) + torch.clamp(displacements * time_steps, min=-100.0, max=100.0)
         vert_x_pred_arr = vert_x_pred_arr.permute([1, 2, 0]).contiguous()
-
-        # Check for NaN/Inf
+    
+        # Same NaN/Inf handling
         if torch.isnan(vert_x_pred_arr).any() or torch.isinf(vert_x_pred_arr).any():
             logger = get_root_logger()
             logger.warning("NaN or Inf detected in interpolated vertices, replacing with safe values")
             vert_x_pred_arr = torch.nan_to_num(vert_x_pred_arr, nan=0.0, posinf=1e6, neginf=-1e6)
-    
+        
+        # Added memory cleanup - only difference
+        del inputs, vert_y_align, displacements
+        
         return vert_x_pred_arr
 
     def compute_interpolation_difference(self, vert_x_pred_arr, vert_y_pred_arr, Pxy):
@@ -359,39 +422,33 @@ class FussModel(BaseModel):
         return {}
         
     def optimize_parameters(self):
-        # zero grad
+        # Zero grad with set_to_none=True for better memory efficiency
         for name in self.optimizers:
             self.optimizers[name].zero_grad(set_to_none=True)
         
-        # Using autocast for mixed-precision training
         with self.amp_context():
             # compute total loss
             loss = sum(v for k, v in self.loss_metrics.items() if k != 'l_total')
             # update loss metrics
             self.loss_metrics['l_total'] = loss
-    
         
         # backward pass with gradient scaling
         self.scaler.scale(loss).backward()
-        # backward pass
-        #loss.backward()
-
-        # clip gradient for stability - FIX HERE:
+        
+        # clip gradient for stability
         if self.opt.get('clip_grad', True):
-            # Only unscale optimizers that exist
-            for name in self.optimizers:
-                self.scaler.unscale_(self.optimizers[name])
-                
-            # Then clip gradients for all networks
+            for key in self.optimizers:
+                self.scaler.unscale_(self.optimizers[key])
             for key in self.networks:
                 torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
-    
+        
         # update weight
         for name in self.optimizers:
             self.scaler.step(self.optimizers[name])
-
+        
         # Update scaler for next iteration
         self.scaler.update()
+        
         
     def validate_single(self, data, timer, tb_logger, index):
         # get data pair
@@ -423,8 +480,9 @@ class FussModel(BaseModel):
         Cyx = evecs_trans_x @ temp_y #(Pxy @ evecs_y)
         
         # convert functional map to point-to-point map
-        p2p_yx = fmap2pointmap_keops(Cxy, evecs_x, evecs_y)
-        p2p_xy = fmap2pointmap_keops(Cyx, evecs_y, evecs_x)
+        with disable_amp():
+            p2p_yx = fmap2pointmap_keops(Cxy, evecs_x, evecs_y)
+            p2p_xy = fmap2pointmap_keops(Cyx, evecs_y, evecs_x)
 
         if tb_logger is not None:
             # [n_vert_x, 3, T+1]
@@ -472,6 +530,7 @@ class FussModel(BaseModel):
                 log_mesh(tb_logger, f'{index}/{i + 1}', vertices=point_pred, faces=face_x, global_step=step)
                 #tb_logger.add_mesh(f'{index}/{i + 1}', vertices=point_pred, faces=face_x,
                 #                   global_step=step)
+            del vert_x_pred_arr, vert_y_pred_arr
         # Return p2p_yx, spectral components (evecs_y, Cxy, evecs_trans_x), and Cxy
         spectral_components = (evecs_y, Cxy, evecs_trans_x)
         
@@ -524,7 +583,9 @@ class FussModel(BaseModel):
         temp_tx = sparse_mm(Ptx, evecs_x.squeeze(0))
         Cxt = evecs_trans_t @ temp_tx.unsqueeze(0) #(Ptx @ evecs_x)
         # convert functional map to point-to-point map
-        p2p_tx = fmap2pointmap_keops(Cxt, evecs_x, evecs_t)
+        
+        with disable_amp():
+            p2p_tx = fmap2pointmap_keops(Cxt, evecs_x, evecs_t)
 
         # from template to shape x
         vert_x_pred_arr = self.compute_displacement(vert_t, vert_x, face_t, None, p2p_tx)

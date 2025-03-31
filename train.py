@@ -1,4 +1,5 @@
-#import os
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 #os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'debug:1'
 #os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
 
@@ -80,6 +81,10 @@ def create_train_val_dataloader(opt, logger):
 
 
 def train_pipeline(root_path):
+
+    import gc
+    cleanup_every = 100  # Adjust based on your model
+    
     # parse options, set distributed setting, set random seed
     opt = parse_options(root_path, is_train=True)
     opt['root_path'] = root_path
@@ -158,6 +163,11 @@ def train_pipeline(root_path):
                     torch.cuda.empty_cache()
                     model.validation(val_loader, tb_logger)
 
+                if model.curr_iter % cleanup_every == 0:
+                    # Force garbage collection and clear CUDA cache
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                
                 data_timer.start()
                 iter_timer.start()
                 # end of iter

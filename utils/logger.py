@@ -220,47 +220,47 @@ def log_mesh(logger, tag, vertices, faces, global_step=None, colors=None):
             showscale=False       # Hide the color scale
         ))
         
-        # Add mesh edges (wireframe) as line segments
-        edges = set()
-        for face in faces_np:
-            # Add edges for each face, ensuring each edge is only added once
-            edges.add(tuple(sorted([int(face[0]), int(face[1])])))
-            edges.add(tuple(sorted([int(face[1]), int(face[2])])))
-            edges.add(tuple(sorted([int(face[2]), int(face[0])])))
+        # # Add mesh edges (wireframe) as line segments
+        # edges = set()
+        # for face in faces_np:
+        #     # Add edges for each face, ensuring each edge is only added once
+        #     edges.add(tuple(sorted([int(face[0]), int(face[1])])))
+        #     edges.add(tuple(sorted([int(face[1]), int(face[2])])))
+        #     edges.add(tuple(sorted([int(face[2]), int(face[0])])))
         
-        # Create edge line segments
-        edge_x = []
-        edge_y = []
-        edge_z = []
+        # # Create edge line segments
+        # edge_x = []
+        # edge_y = []
+        # edge_z = []
         
-        for edge in edges:
-            # Add the first vertex
-            edge_x.append(vertices_np[edge[0], 0])
-            edge_y.append(vertices_np[edge[0], 1])
-            edge_z.append(vertices_np[edge[0], 2])
+        # for edge in edges:
+        #     # Add the first vertex
+        #     edge_x.append(vertices_np[edge[0], 0])
+        #     edge_y.append(vertices_np[edge[0], 1])
+        #     edge_z.append(vertices_np[edge[0], 2])
             
-            # Add the second vertex
-            edge_x.append(vertices_np[edge[1], 0])
-            edge_y.append(vertices_np[edge[1], 1])
-            edge_z.append(vertices_np[edge[1], 2])
+        #     # Add the second vertex
+        #     edge_x.append(vertices_np[edge[1], 0])
+        #     edge_y.append(vertices_np[edge[1], 1])
+        #     edge_z.append(vertices_np[edge[1], 2])
             
-            # Add None to create separation between edges
-            edge_x.append(None)
-            edge_y.append(None)
-            edge_z.append(None)
+        #     # Add None to create separation between edges
+        #     edge_x.append(None)
+        #     edge_y.append(None)
+        #     edge_z.append(None)
         
-        # Add the edges as a scatter3d trace
-        fig.add_trace(go.Scatter3d(
-            x=edge_x,
-            y=edge_y,
-            z=edge_z,
-            mode='lines',
-            line=dict(
-                color='black',
-                width=1.5
-            ),
-            hoverinfo='none'
-        ))
+        # # Add the edges as a scatter3d trace
+        # fig.add_trace(go.Scatter3d(
+        #     x=edge_x,
+        #     y=edge_y,
+        #     z=edge_z,
+        #     mode='lines',
+        #     line=dict(
+        #         color='black',
+        #         width=1.5
+        #     ),
+        #     hoverinfo='none'
+        # ))
         
         # Enhanced layout settings
         fig.update_layout(
