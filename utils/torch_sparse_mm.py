@@ -1,4 +1,44 @@
 import torch
+from typing import Tuple, Optional
+
+# ===== JIT-Optimized Helper Functions =====
+
+@torch.jit.script
+def _decompress_row_indices(crow_indices: torch.Tensor, num_rows: int) -> torch.Tensor:
+    """Convert CSR crow indices to row indices"""
+    row_indices = torch.repeat_interleave(
+        torch.arange(num_rows, device=crow_indices.device, dtype=crow_indices.dtype),
+        crow_indices[1:] - crow_indices[:-1]
+    )
+    return row_indices
+
+@torch.jit.script
+def _compute_gradA_elements(grad_select: torch.Tensor, B_select: torch.Tensor) -> torch.Tensor:
+    """Element-wise multiplication and sum for gradA computation"""
+    gradB_ewise = grad_select * B_select
+    gradA = torch.sum(gradB_ewise, dim=1)
+    return gradA
+
+@torch.jit.script
+def _index_select_pair(grad: torch.Tensor, B: torch.Tensor, 
+                      row_idx: torch.Tensor, col_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Paired index selection for gradient computation"""
+    grad_select = grad.index_select(0, row_idx)
+    B_select = B.index_select(0, col_idx)
+    return grad_select, B_select
+
+@torch.jit.script
+def _compute_batched_gradB(A_t: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+    """Optimized sparse-dense matmul for gradB"""
+    return torch.sparse.mm(A_t, grad)
+
+@torch.jit.script
+def _reshape_batched_result(x: torch.Tensor, batch_size: int, 
+                          rows: int, cols: int) -> torch.Tensor:
+    """Reshape result for batched inputs"""
+    return x.view(batch_size, rows, cols)
+
+
 def stack_csr(tensors, dim=0):
     """
     Stacks a list of CSR tensors along the batch dimension.
@@ -477,24 +517,18 @@ def sparse_eye(
     else:
         raise ValueError("Layout {} not supported. Only sparse_coo and sparse_csr are supported.".format(layout))
 
-def sparse_mm(A, B):
+def sparse_mm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
-    Performs a matrix multiplication between a sparse matrix A and a dense matrix B,
-    preserving the sparsity of the gradient with respect to A, permitting sparse backpropagation.
-
-    The sparse matrix A can be in either COO or CSR format, and is expected
-    to be 2-dimensional, with an optional leading batch dimension. The dense matrix B
-    should also be 2-dimensional, with a matching optional leading batch dimension.
-    The batch size must be the same for both A and B.
-
+    Memory-efficient sparse matrix multiplication with sparse gradient support.
+    Performs A @ B where A is sparse (COO or CSR) and B is dense.
+    
     Args:
-        A (torch.Tensor): The sparse matrix in COO or CSR format.
-        B (torch.Tensor): The dense matrix.
-
+        A (torch.Tensor): Sparse matrix (COO or CSR format)
+        B (torch.Tensor): Dense matrix
+        
     Returns:
-        torch.Tensor: The result of the matrix multiplication.
+        torch.Tensor: Result of A @ B
     """
-
     if not isinstance(A, torch.Tensor) or not isinstance(B, torch.Tensor):
         raise ValueError("Both A and B should be instances of torch.Tensor")
 
@@ -502,166 +536,147 @@ def sparse_mm(A, B):
         raise ValueError("Both A and B should be at least 2-dimensional tensors")
 
     if A.dim() != B.dim():
-        raise ValueError("Both A and B should have the same number of dimensions")
+        raise ValueError("A and B should have the same number of dimensions")
 
     if A.layout not in {torch.sparse_coo, torch.sparse_csr}:
         raise ValueError("A should be in either COO or CSR format")
 
     if A.dim() == 3 and A.size(0) != B.size(0):
-        raise ValueError("If A and B have a leading batch dimension, they should have the same batch size")
+        raise ValueError("A and B must have the same batch size if batched")
 
     return SparseMatMul.apply(A, B)
 
 
 class SparseMatMul(torch.autograd.Function):
     """
-    Matrix multiplication between sparse matrix (A)
-    and dense matrix (B), with support for backpropagation
-    Matrix A can be in either COO or CSR format
-
-    This implementation provides a memory efficient version of
-    torch.sparse.mm on the backward pass, working around the issue described in:
-    https://github.com/pytorch/pytorch/issues/41128
-
-    Optimized for compatibility with Automatic Mixed Precision (AMP) training.
+    Custom autograd function for memory-efficient sparse matrix multiplication
+    with sparse-aware gradient computation.
     """
-
     @staticmethod
     def forward(ctx, A, B):
-        # Save shapes and dimensions for backward
+        # Save metadata for backward pass
         ctx.batch_size = B.size()[0] if B.dim() == 3 else None
         ctx.A_shape = A.size()  # (b), n, m
         ctx.B_shape = B.size()  # (b), m, p
-        
-        # Save original dtypes for backward
         ctx.A_dtype = A.dtype
         ctx.B_dtype = B.dtype
+        ctx.A_layout = A.layout
         ctx.requires_grad_A = A.requires_grad
         ctx.requires_grad_B = B.requires_grad
-
-        # Track if gradients are needed
-        grad_flag = A.requires_grad or B.requires_grad
 
         # Detach inputs for forward computation
         A, B = A.detach(), B.detach()
         
         # Ensure consistent dtype for sparse matrix multiplication
-        # Sparse operations generally need to be in the same precision
-        # Usually we use the higher precision (typically float32)
         if A.dtype != B.dtype:
-            # Convert B to match A's precision - sparse matrix is the driving factor
-            B_orig = B
             B = B.to(dtype=A.dtype)
             
-        # Handle batched inputs if present
+        # Handle batched inputs
         if ctx.batch_size is not None:
-            A = sparse_block_diag(*A)
-            B = torch.cat([*B])
+            # These operations aren't JIT compatible but are rarely the bottleneck
+            from utils.torch_sparse_mm import sparse_block_diag
+            A_batched = sparse_block_diag(*A)
+            B_batched = torch.cat([*B])
+        else:
+            A_batched = A
+            B_batched = B
 
-        # Perform sparse matrix multiplication
+        # Perform sparse matrix multiplication - NO TRY/EXCEPT in JIT
+        # We'll handle exceptions in pure Python
         try:
-            x = torch.sparse.mm(A, B)
+            x = torch.sparse.mm(A_batched, B_batched)
         except RuntimeError as e:
-            # If we hit CUDA errors despite type conversion, try full float32
-            if "cusparseSpMM" in str(e) and A.dtype != torch.float32:
-                A_float = A.to(dtype=torch.float32)
-                B_float = B.to(dtype=torch.float32)
+            # Fall back to float32 if we have CUDA errors
+            if "CUDA" in str(e) and A_batched.dtype != torch.float32:
+                A_float = A_batched.to(dtype=torch.float32)
+                B_float = B_batched.to(dtype=torch.float32)
                 x = torch.sparse.mm(A_float, B_float)
-                # Convert back to original dtype if needed
+                # Convert back to original dtype
                 if ctx.B_dtype != torch.float32:
                     x = x.to(dtype=ctx.B_dtype)
             else:
                 raise e
 
         # Save tensors for backward pass
-        ctx.save_for_backward(A, B)
+        ctx.save_for_backward(A_batched, B_batched)
 
-        # Reshape result if batched
+        # Reshape result for batched inputs
         if ctx.batch_size is not None:
-            x = x.view(ctx.batch_size, ctx.A_shape[-2], ctx.B_shape[-1])
+            x = _reshape_batched_result(x, ctx.batch_size, ctx.A_shape[-2], ctx.B_shape[-1])
 
-        # Set requires_grad flag
-        x.requires_grad = grad_flag
         return x
 
     @staticmethod
-    def backward(ctx, grad):
+    def backward(ctx, grad_output):
         A, B = ctx.saved_tensors
         
-        # Track original grad dtype for final output consistency
-        orig_grad_dtype = grad.dtype
-        
-        # Handle batched inputs
+        # Ensure grad has proper shape for batched processing
+        grad = grad_output
         if ctx.batch_size is not None:
             grad = torch.cat([*grad])
         
-        # Ensure consistent dtypes between sparse and dense tensors for backward operations
-        # For sparse operations, it's usually better to convert to the higher precision (float32)
+        # Ensure consistent dtype 
+        orig_grad_dtype = grad.dtype
         if A.dtype != grad.dtype:
-            # Convert grad to match A's precision (usually float32)
             grad = grad.to(dtype=A.dtype)
         
-        # Extract indices based on sparse format
-        if A.layout == torch.sparse_coo:
-            A_row_idx, A_col_idx = A._indices()
-        elif A.layout == torch.sparse_csr:
-            A_col_idx = A.col_indices()
-            A_crow_idx = A.crow_indices()
-            # Uncompress row indices:
-            A_row_idx = torch.repeat_interleave(
-                torch.arange(A.size()[0], device=A.device), A_crow_idx[1:] - A_crow_idx[:-1]
-            )
-        else:
-            raise ValueError(f"Unsupported layout: {A.layout}")
-
-        # Compute gradA elements-wise using efficient dot product
-        grad_select = grad.index_select(0, A_row_idx)  # grad[i, :]
-        B_select = B.index_select(0, A_col_idx)  # B[j, :]
+        # Initialize gradients
+        gradA_sparse = None
+        gradB = None
         
-        # Ensure matching dtypes for multiplication
-        if B_select.dtype != grad_select.dtype:
-            B_select = B_select.to(dtype=grad_select.dtype)
-        
-        # Element-wise multiplication and sum for efficient dot product
-        gradB_ewise = grad_select * B_select
-        gradA = torch.sum(gradB_ewise, dim=1)
-
-        # Create a sparse tensor of the gradient with respect to the non-zeros of A
+        # Compute gradA if needed (memory-efficient path)
         if ctx.requires_grad_A:
+            # Extract indices based on sparse format
             if A.layout == torch.sparse_coo:
-                gradA_sparse = torch.sparse_coo_tensor(A._indices(), gradA, A.shape)
+                indices = A._indices()
+                A_row_idx, A_col_idx = indices[0], indices[1]
+            elif A.layout == torch.sparse_csr:
+                A_col_idx = A.col_indices()
+                A_crow_idx = A.crow_indices()
+                # Decompress row indices using JIT-optimized function
+                A_row_idx = _decompress_row_indices(A_crow_idx, A.size()[0])
+            else:
+                raise ValueError(f"Unsupported layout: {A.layout}")
+
+            # Use JIT-optimized element-wise operations
+            grad_select, B_select = _index_select_pair(grad, B, A_row_idx, A_col_idx)
+            
+            # Ensure matching dtypes
+            if B_select.dtype != grad_select.dtype:
+                B_select = B_select.to(dtype=grad_select.dtype)
+            
+            # Compute gradA elements
+            gradA = _compute_gradA_elements(grad_select, B_select)
+
+            # Create sparse tensor from gradA
+            if A.layout == torch.sparse_coo:
+                indices = A._indices()
+                gradA_sparse = torch.sparse_coo_tensor(indices, gradA, A.shape)
             elif A.layout == torch.sparse_csr:
                 gradA_sparse = torch.sparse_csr_tensor(A_crow_idx, A_col_idx, gradA, A.shape)
-        else:
-            gradA_sparse = None
-
-        # Compute the dense gradient with respect to B
+        
+        # Compute gradB if needed
         if ctx.requires_grad_B:
-            # Ensure matching dtypes for sparse matrix multiplication
-            if A.dtype != grad.dtype:
-                grad = grad.to(dtype=A.dtype)
+            # Use JIT-optimized sparse matmul for gradB
+            gradB = _compute_batched_gradB(A.t(), grad)
             
-            # Perform sparse matrix multiplication for gradB
-            gradB = torch.sparse.mm(A.t(), grad)
-            
-            # Convert back to original input dtype if necessary
+            # Convert back to original dtype if needed
             if gradB.dtype != ctx.B_dtype:
                 gradB = gradB.to(dtype=ctx.B_dtype)
-        else:
-            gradB = None
-
-        # Handle batch dimension for outputs
+        
+        # Handle batched output
         if ctx.batch_size is not None:
             if gradA_sparse is not None:
+                from utils.torch_sparse_mm import sparse_block_diag_split
                 shapes = ctx.A_shape[0] * (ctx.A_shape[-2:],)
                 gradA_split = sparse_block_diag_split(gradA_sparse, *shapes)
                 if A.layout == torch.sparse_coo:
                     gradA_sparse = torch.stack([*gradA_split])
                 else:
-                    gradA_sparse = stack_csr([*gradA_split])  # NOTE: torch.stack does not work for csr tensors
+                    from utils.torch_sparse_mm import stack_csr
+                    gradA_sparse = stack_csr([*gradA_split])  # stack_csr for CSR tensors
             
             if gradB is not None:
                 gradB = gradB.view(ctx.B_shape)
         
-        # Return gradients
         return gradA_sparse, gradB

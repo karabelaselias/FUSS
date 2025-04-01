@@ -7,7 +7,6 @@ from torch_scatter import scatter_max
 from typing import Optional, Dict, Tuple
 from utils.registry import NETWORK_REGISTRY
 
-
 @NETWORK_REGISTRY.register()
 class SparseSimilarity(nn.Module):
     """Ultra-optimized sparse similarity implementation for A100 GPUs
@@ -20,7 +19,7 @@ class SparseSimilarity(nn.Module):
         hard: Whether to use hard assignment (one-hot) instead of soft assignment
         use_half: Whether to use half precision (FP16) for computations
     """
-    def __init__(self, tau=0.05, k_neighbors=10, chunk_size=4096, streams=2, hard=False, use_half=True, respect_global_amp=False):
+    def __init__(self, tau=0.05, k_neighbors=10, chunk_size=4096, streams=2, hard=False):
         super(SparseSimilarity, self).__init__()
         self.tau = tau
         self.k_neighbors = k_neighbors
@@ -28,11 +27,7 @@ class SparseSimilarity(nn.Module):
         self.base_chunk_size = chunk_size
         self.streams = streams
         self.hard = hard
-        self.use_half = use_half
         self.use_streams = streams > 1 and not self.hard
-        
-        # Use this flag to determine if we need our own precision control
-        self.force_precision_control = not respect_global_amp
         
         # Enable TF32 for A100
         self._original_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -108,7 +103,6 @@ class SparseSimilarity(nn.Module):
         # Pre-allocate outputs with optimized dtype
         max_elements = n_x * self.k_neighbors
         indices = torch.empty((2, max_elements), dtype=torch.int32, device=device)
-        #values = torch.empty(max_elements, dtype=torch.float16 if self.use_half else torch.float32, device=device)
         values = torch.empty(max_elements, device=device)
         
         # Get optimal chunk size
@@ -134,10 +128,7 @@ class SparseSimilarity(nn.Module):
             feat_x_2d = feat_x_chunk  # [chunk, C]
             feat_y_2d = feat_y[0]  # [n_y, C]
             
-            # Use optimized matmul for A100 tensor cores
-            with torch.amp.autocast(device_type='cuda', enabled=self.force_precision_control and self.use_half):
-                similarity = torch.matmul(feat_x_2d, feat_y_2d.transpose(-2, -1))  # [chunk, n_y]
-        
+            similarity = torch.matmul(feat_x_2d, feat_y_2d.transpose(-2, -1))  # [chunk, n_y]
             # Find top-k with A100 optimization
             top_values, top_indices = self._optimized_topk(similarity)
             
@@ -159,7 +150,7 @@ class SparseSimilarity(nn.Module):
         # Trim excess pre-allocated space
         indices = indices[:, :ptr]
         values = values[:ptr]
-        
+ 
         # Create sparse tensor with 2D layout
         sparse_tensor = torch.sparse_coo_tensor(
             indices, values, (n_x, n_y), device=device
@@ -220,10 +211,7 @@ class SparseSimilarity(nn.Module):
                     feat_x_2d = feat_x_chunk  # [chunk, C]
                     feat_y_2d = feat_y[0]  # [n_y, C]
                     
-                    # Use optimized matmul for A100 tensor cores
-                    with torch.amp.autocast(device_type='cuda', enabled=self.force_precision_control and self.use_half):
-                        similarity = torch.matmul(feat_x_2d, feat_y_2d.transpose(-2, -1))  # [chunk, n_y]
-                    
+                    similarity = torch.matmul(feat_x_2d, feat_y_2d.transpose(-2, -1))  # [chunk, n_y]
                     # Find top-k with A100 optimization
                     top_values, top_indices = self._optimized_topk(similarity)
                     
@@ -251,6 +239,7 @@ class SparseSimilarity(nn.Module):
         values = values[:total_ptr]
         
         # Create sparse tensor
+        #sparse_tensor = create_csr_directly(indices, values, n_x, n_y, device)
         sparse_tensor = torch.sparse_coo_tensor(
             indices, values, (n_x, n_y), device=device
         ).coalesce()
@@ -270,14 +259,26 @@ class SparseSimilarity(nn.Module):
         if not similarity.is_contiguous():
             similarity = similarity.contiguous()
         
+        topk_values, topk_indices = torch.topk(
+            similarity, k=self.k_neighbors, dim=1, sorted=False
+        )     
+        
+        # With numerically stable manual implementation:
+        #topk_logsoftmax = F.log_softmax(topk_values, dim=1)
+        
+        maxes = torch.max(topk_values, dim=1, keepdim=True)[0]
+        exp_vals = torch.exp(topk_values - maxes)
+        sums = torch.sum(exp_vals, dim=1, keepdim=True)
+        topk_softmax = exp_vals / sums
+        
         # Use FP16 for topk computation which is faster on A100
-        with torch.amp.autocast(device_type='cuda', enabled=self.force_precision_control and self.use_half):
-            # Find top-k values and indices
-            topk_values, topk_indices = torch.topk(
-                similarity, k=self.k_neighbors, dim=1, sorted=False
-            )     
-            # Apply softmax with FP16 precision for better tensor core utilization
-            topk_softmax = F.softmax(topk_values, dim=1)
+        #with torch.amp.autocast(device_type='cuda', enabled=self.force_precision_control and self.use_half):
+        #    # Find top-k values and indices
+        #    topk_values, topk_indices = torch.topk(
+        #        similarity, k=self.k_neighbors, dim=1, sorted=False
+        #    )     
+        #    # Apply softmax with FP16 precision for better tensor core utilization
+        #    topk_softmax = F.softmax(topk_values, dim=1)
         
         return topk_softmax, topk_indices
     
@@ -336,7 +337,7 @@ class SparseSimilarity(nn.Module):
             return self._convert_to_hard_assignment(sparse_tensor)
         
         return sparse_tensor.to_sparse_csr()
-
+    
     def _convert_to_hard_assignment(self, sparse_tensor):
         """A100-optimized hard assignment conversion with better gradient flow"""
         indices = sparse_tensor.indices()

@@ -356,7 +356,7 @@ class SparseSimilarityOld(nn.Module):
             
             # Free memory
             del similarity, similarity_topk, topk_indices, topk_softmax, row_indices
-            torch.cuda.empty_cache()
+            #torch.cuda.empty_cache()
         
         # Create sparse tensor
         if indices_list:
@@ -429,7 +429,7 @@ class SparseSimilarityOld(nn.Module):
             
             # Free memory
             del chunk, chunk_topk, topk_indices, topk_softmax, row_indices
-            torch.cuda.empty_cache()
+            #torch.cuda.empty_cache()
         
         # Create sparse tensor
         if indices_list:
@@ -524,7 +524,7 @@ class SparseSimilarityOld(nn.Module):
                 # Free memory immediately
                 del similarity, similarity_topk, topk_indices, topk_softmax
                 del batch_indices, row_indices, col_indices
-                torch.cuda.empty_cache()
+                #torch.cuda.empty_cache()
         
         # Create sparse tensor
         if indices_list:
@@ -603,7 +603,7 @@ class SparseSimilarityOld(nn.Module):
                 # Free memory immediately
                 del chunk, chunk_topk, topk_indices, topk_softmax
                 del batch_indices, row_indices, col_indices
-                torch.cuda.empty_cache()
+                #torch.cuda.empty_cache()
         
         # Create sparse tensor
         if indices_list:

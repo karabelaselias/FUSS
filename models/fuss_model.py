@@ -15,15 +15,10 @@ from utils.tensor_util import to_device, to_numpy
 from utils.fmap_util import fmap2pointmap_keops
 from utils.torch_sparse_mm import sparse_mm
 from utils.amp_utils import disable_amp
+from utils.memory_utils import profile_memory, memory_efficient_computation
 
 import gc
 
-
-def print_memory_stats(label):
-    print(f"\n=== {label} ===")
-    print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-    print(f"Reserved:  {torch.cuda.memory_reserved() / 1e9:.2f} GB")
-    print(f"Max allocated: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
 @MODEL_REGISTRY.register()
 class FussModel(BaseModel):
@@ -55,29 +50,17 @@ class FussModel(BaseModel):
             }
         
         with self.amp_context():
-            #print_memory_stats("Start of feed_data")
             # get data pair
             data_x, data_y = transfer_batch_to_device(data['first'], self.device), transfer_batch_to_device(data['second'], self.device)
             assert data_x['verts'].shape[0] == 1, 'Only supports batch size = 1.'
-            #print(f"Vertex shapes: x={data_x['verts'].shape}, y={data_y['verts'].shape}")
-            
-            # extract feature
-            #feat_x = self.networks['feature_extractor'](data_x['verts'], data_x['faces'])  # [B, Nx, C]
-            #feat_y = self.networks['feature_extractor'](data_y['verts'], data_y['faces'])  # [B, Ny, C]
-
+         
             self.network_timers['feature_extractor'].start()
             feat_x = self.networks['feature_extractor'](data_x)  # [B, Nx, C]
             feat_y = self.networks['feature_extractor'](data_y)  # [B, Ny, C]
             self.network_timers['feature_extractor'].record()
             
-            #print(f"Feature shapes: x={feat_x.shape}, y={feat_y.shape}")
-            #print_memory_stats("After feature extraction")
-    
-            #print_memory_stats("Before permutation computation")
             self.network_timers['permutation'].start()
             Pxy, Pyx = self.compute_permutation_matrix(feat_x, feat_y, bidirectional=True)  # [B, Nx, Ny], [B, Ny, Nx]
-            #print(f"Permutation matrix shapes: Pxy={Pxy.shape}, nnz={Pxy._nnz()}")
-            #print_memory_stats("After permutation computation")
             self.network_timers['permutation'].record()
             
             # compute functional map related loss
@@ -87,7 +70,6 @@ class FussModel(BaseModel):
                 self.network_timers['fmap_net'].record()
     
             # Interpolation
-            #Pxy, Pyx = Pxy.squeeze(0), Pyx.squeeze(0)
             vert_x, vert_y = data_x['verts'].squeeze(0), data_y['verts'].squeeze(0)
             face_x, face_y = data_x['faces'].squeeze(0), data_y['faces'].squeeze(0)
     
@@ -193,7 +175,8 @@ class FussModel(BaseModel):
             
 
     def compute_earth_mover_distance(self, vert_x, vert_y):
-        loss_emd = self.losses['earth_mover_loss'](vert_x, vert_y)
+        with disable_amp():
+            loss_emd = self.losses['earth_mover_loss'](vert_x, vert_y)
         return loss_emd
         
     def compute_chamfer_distance(self, vert_x, vert_y, face_x, face_y):
@@ -239,7 +222,6 @@ class FussModel(BaseModel):
                                                 vert_x_pred_arr[:, :, self.pose_timestep], face_x)
             self.loss_metrics['l_edge'] += self.losses['edge_shape_loss'](
                                                 vert_y_pred_arr[:, :, self.pose_timestep], face_y)
-
 
     def compute_permutation_matrix(self, feat_x, feat_y, bidirectional=False):
         """
@@ -388,11 +370,11 @@ class FussModel(BaseModel):
 
         if 'couple_loss' in self.losses:
             # Check if using sparse format
-            evecs_y_pb = sparse_mm(Pxy, evecs_y.squeeze()).unsqueeze(0) #apply_sparse_similarity(Pxy, evecs_y)
-            evecs_x_pb = sparse_mm(Pyx, evecs_x.squeeze()).unsqueeze(0)
+            evecs_y_pb = sparse_mm(Pxy, evecs_y.squeeze())
+            evecs_x_pb = sparse_mm(Pyx, evecs_x.squeeze())
                         
-            Cyx_est, Cxy_est = torch.bmm(evecs_trans_x, evecs_y_pb), \
-                               torch.bmm(evecs_trans_y, evecs_x_pb)
+            Cyx_est, Cxy_est = torch.mm(evecs_trans_x.squeeze(), evecs_y_pb).unsqueeze(0), \
+                               torch.mm(evecs_trans_y.squeeze(), evecs_x_pb).unsqueeze(0)
 
             self.loss_metrics['l_couple'] = self.losses['couple_loss'](Cxy, Cxy_est) + \
                                          self.losses['couple_loss'](Cyx, Cyx_est)
@@ -422,32 +404,36 @@ class FussModel(BaseModel):
         return {}
         
     def optimize_parameters(self):
-        # Zero grad with set_to_none=True for better memory efficiency
-        for name in self.optimizers:
-            self.optimizers[name].zero_grad(set_to_none=True)
-        
         with self.amp_context():
             # compute total loss
             loss = sum(v for k, v in self.loss_metrics.items() if k != 'l_total')
-            # update loss metrics
+            # Scale loss by accumulation steps
+            scaled_loss = loss / self.accumulation_steps
+            # Store original loss for logging
             self.loss_metrics['l_total'] = loss
         
         # backward pass with gradient scaling
-        self.scaler.scale(loss).backward()
+        self.scaler.scale(scaled_loss).backward()
         
-        # clip gradient for stability
-        if self.opt.get('clip_grad', True):
-            for key in self.optimizers:
-                self.scaler.unscale_(self.optimizers[key])
-            for key in self.networks:
-                torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
+        self.accumulation_counter += 1
         
-        # update weight
-        for name in self.optimizers:
-            self.scaler.step(self.optimizers[name])
-        
-        # Update scaler for next iteration
-        self.scaler.update()
+        # Only update weights after accumulation_steps
+        if self.accumulation_counter >= self.accumulation_steps:
+            # clip gradient for stability
+            if self.opt.get('clip_grad', True):
+                for key in self.optimizers:
+                    self.scaler.unscale_(self.optimizers[key])
+                for key in self.networks:
+                    torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
+            
+            # update weights
+            for name in self.optimizers:
+                self.scaler.step(self.optimizers[name])
+                self.optimizers[name].zero_grad(set_to_none=True)
+            
+            # Update scaler for next iteration
+            self.scaler.update()
+            self.accumulation_counter = 0
         
         
     def validate_single(self, data, timer, tb_logger, index):

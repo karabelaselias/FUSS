@@ -5,8 +5,10 @@ from densemaps.torch import maps
 
 def keops_nn(feat_x, feat_y, blur=None):
     """Optimized FAISS GPU implementation with PyTorch tensor support"""
-    feat_x = feat_x.contiguous()
-    feat_y = feat_y.contiguous()
+    if not feat_x.is_contiguous():
+        feat_x = feat_x.contiguous()
+    if not feat_y.is_contiguous():
+        feat_y = feat_y.contiguous()
     P21 = maps.KernelDistMap(feat_x, feat_y, blur)  # A "dense" kernel map, not used in memory
     p2p_21 = P21.get_nn()  # I can get the (N2,) vertex to vertex map
     return p2p_21

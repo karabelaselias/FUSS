@@ -21,6 +21,9 @@ from utils.options import dict2str, parse_options
 
 import torch.autograd.profiler as profiler
 
+import torch.profiler
+
+
 #def init_tb_loggers(opt):
 #    tb_logger = init_tb_logger(opt['path']['experiments_root'])
 #    return tb_logger
@@ -120,11 +123,19 @@ def train_pipeline(root_path):
             train_sampler.set_epoch(model.curr_epoch)
             for train_data in train_loader:
                 data_timer.record()
-
                 model.curr_iter += 1
                 # Process data and forward/backward pass with profiling
-                
+                #with torch.profiler.profile(
+                #    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                #    record_shapes=True,
+                #    profile_memory=True,
+                #    with_stack=True
+                #) as prof:
                 model.feed_data(train_data)
+                #print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+                #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
+                #print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=20))
+                
                 backward_timer.start()
                 model.optimize_parameters()
                 backward_timer.record()

@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 
 from utils.registry import NETWORK_REGISTRY
+from utils.amp_utils import disable_amp
+
 
 def get_mask(evals1, evals2, resolvant_gamma):
     """Compute mask for functional map regularization"""
@@ -72,12 +74,13 @@ class RegularizedFMNetOptimized(torch.nn.Module):
             systems_flat = systems.reshape(-1, K, K)  # [B*chunk_size, K, K]
             rhs_flat = rhs.permute(0, 2, 1, 3).reshape(-1, K, 1)  # [B*chunk_size, K, 1]
 
-            # Selectively cast to float32 for linear solve
-            systems_flat = systems_flat.float()
-            rhs_flat = rhs_flat.float()
+            # CRITICAL: Ensure we're using float32 for solve regardless of AMP
+            systems_flat = systems_flat.to(torch.float32)
+            rhs_flat = rhs_flat.to(torch.float32)
             
             # Solve all systems in the chunk at once
-            C_flat = torch.linalg.solve(systems_flat, rhs_flat)
+            with disable_amp():
+                C_flat = torch.linalg.solve(systems_flat, rhs_flat)
             
             # Convert back to original dtype if needed
             C_flat = C_flat.to(feat_x.dtype)
@@ -85,6 +88,7 @@ class RegularizedFMNetOptimized(torch.nn.Module):
             # Reshape back and store results
             C_chunk = C_flat.reshape(B_size, chunk_end-chunk_start, K, 1)
             Cxy[:, chunk_start:chunk_end] = C_chunk.squeeze(-1)
+            del systems, rhs, systems_flat, rhs_flat, C_flat, C_chunk, D_batch
             
         return Cxy
     

@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import EdgeConv
-from torch_geometric.utils import to_torch_sparse_tensor
+from torch.utils.checkpoint import checkpoint
+from torch_geometric.nn import EdgeConv, global_max_pool
+from torch_geometric.utils import to_torch_sparse_tensor, scatter
+
 
 from utils.registry import NETWORK_REGISTRY
 
@@ -38,7 +40,7 @@ class ResnetBlockFC(nn.Module):
         # Submodules
         self.fc_0 = nn.Linear(size_in, size_h)
         self.fc_1 = nn.Linear(size_h, size_out)
-        self.actvn = nn.ReLU()
+        self.actvn = nn.ReLU(inplace=True)
 
         if size_in == size_out:
             self.shortcut = None
@@ -46,27 +48,34 @@ class ResnetBlockFC(nn.Module):
             self.shortcut = nn.Linear(size_in, size_out, bias=False)
 
     def forward(self, x):
-        net = self.fc_0(self.actvn(x))
-        dx = self.fc_1(self.actvn(net))
+        net = self.actvn(x)  # Assuming actvn is set to inplace=True
+        net = self.fc_0(net)
 
+        # Second activation in-place
+        self.actvn(net)  # In-place
+        dx = self.fc_1(net)
+        
         if self.shortcut is not None:
             x_s = self.shortcut(x)
         else:
             x_s = x
 
-        return x_s + dx
+        x_s.add_(dx)  # In-place
+        return x_s
 
 
 def get_edge_index(face):
+    # More efficient implementation 
     edge_index_one = torch.cat(
         (face[:, [0, 1]], face[:, [0, 2]], face[:, [1, 2]]), 0).t()
-    # undirected edge
-    edge_index = torch.zeros([2, edge_index_one.shape[1] * 2], dtype=face.dtype, device=face.device)
+    
+    # Create edge indices directly without intermediate tensors
+    edge_index = torch.zeros([2, edge_index_one.shape[1] * 2], 
+                            dtype=face.dtype, device=face.device)
     edge_index[:, :edge_index_one.shape[1]] = edge_index_one
     edge_index[0, edge_index_one.shape[1]:] = edge_index_one[1, :]
     edge_index[1, edge_index_one.shape[1]:] = edge_index_one[0, :]
     return edge_index
-
 
 def maxpool(x, dim=-1, keepdim=False):
     out, _ = x.max(dim=dim, keepdim=keepdim)
@@ -98,7 +107,7 @@ class ResnetECPos(torch.nn.Module):
         else:
             self.fc_c = torch.nn.Linear(hidden_dim, c_dim)
 
-        self.actvn = torch.nn.ReLU()
+        self.actvn = torch.nn.ReLU(inplace=True)
         self.pool = maxpool
     
     #@torch.compile(dynamic=True)
@@ -111,29 +120,40 @@ class ResnetECPos(torch.nn.Module):
             squeeze = True
         edge_index = get_edge_index(faces)
         p = verts if feats is None else feats
+        
         # Convert to sparse representation
-        adj = to_torch_sparse_tensor(edge_index)
+        #adj = to_torch_sparse_tensor(edge_index)
         net = self.fc_pos(p)
-        net = self.block_0(net, adj)
-
+        
+        net = checkpoint(self.block_0, net, edge_index, use_reentrant=False)
         pooled = self.pool(net, dim=1, keepdim=True).expand(net.size())
         net = torch.cat([net, pooled, p], dim=1)
+        del pooled  # Free memory immediately
 
-        net = self.block_1(net, adj)
+        #net = self.block_1(net, adj)
+        net = checkpoint(self.block_1, net, edge_index, use_reentrant=False)
         pooled = self.pool(net, dim=1, keepdim=True).expand(net.size())
         net = torch.cat([net, pooled, p], dim=1)
+        del pooled  # Free memory immediately
 
-        net = self.block_2(net, adj)
+        #net = self.block_2(net, adj)
+        net = checkpoint(self.block_2, net, edge_index, use_reentrant=False)
         pooled = self.pool(net, dim=1, keepdim=True).expand(net.size())
         net = torch.cat([net, pooled, p], dim=1)
+        del pooled  # Free memory immediately
 
-        net = self.block_3(net, adj)
+        #net = self.block_3(net, adj)
+        net = checkpoint(self.block_3, net, edge_index, use_reentrant=False)
         pooled = self.pool(net, dim=1, keepdim=True).expand(net.size())
         net = torch.cat([net, pooled, p], dim=1)
+        del pooled  # Free memory immediately
 
-        net = self.block_4(net, adj)
+        #net = self.block_4(net, adj)
+        net = checkpoint(self.block_4, net, edge_index, use_reentrant=False)
 
-        c = self.fc_c(self.actvn(net))
+        # Apply activation in-place before final layer
+        self.actvn(net)  # In-place
+        c = self.fc_c(net)
 
         if squeeze:
             c = c.unsqueeze(0)

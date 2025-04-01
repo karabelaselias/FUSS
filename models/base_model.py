@@ -27,6 +27,7 @@ from utils.tensor_util import to_numpy
 from utils.shape_util import read_shape
 from datasets.shape_dataset import get_spectral_ops
 from models.pca_model import SSMPCA
+from utils.amp_utils import disable_amp
 
 from torch.cuda.amp import autocast, GradScaler
 
@@ -49,6 +50,9 @@ class BaseModel:
         self.is_train = opt['is_train']
 
         self.scaler = GradScaler(enabled=(self.device.type == 'cuda' and opt.get('use_amp', False)))
+
+        self.accumulation_steps = opt.get('accumulation_steps', 4)
+        self.accumulation_counter = 0
         
         # build networks
         self.networks = OrderedDict()
@@ -93,44 +97,36 @@ class BaseModel:
             pass
 
     def optimize_parameters(self):
-        """forward pass"""
-        
-        # Using autocast for mixed-precision training
         with self.amp_context():
             # compute total loss
-            loss = 0.0
-            for k, v in self.loss_metrics.items():
-                if k != 'l_total':
-                    loss += v
-            # update loss metrics
+            loss = sum(v for k, v in self.loss_metrics.items() if k != 'l_total')
+            # Scale loss by accumulation steps
+            scaled_loss = loss / self.accumulation_steps
+            # Store original loss for logging
             self.loss_metrics['l_total'] = loss
         
-        
-        # zero grad
-        for name in self.optimizers:
-            self.optimizers[name].zero_grad(set_to_none=True)
-
         # backward pass with gradient scaling
-        self.scaler.scale(loss).backward()
-        # backward pass
-        #loss.backward()
-
-        # clip gradient for stability
-        if self.opt.get('clip_grad', True):
-            for key in self.networks:
-                self.scaler.unscale_(self.optimizers[key])
-                torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
-
-        # clip gradient for stability
-        #for key in self.networks:
-        #    torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
-
-        # update weight
-        for name in self.optimizers:
-            self.scaler.step(self.optimizers[name])
-
-        # Update scaler for next iteration
-        self.scaler.update()
+        self.scaler.scale(scaled_loss).backward()
+        
+        self.accumulation_counter += 1
+        
+        # Only update weights after accumulation_steps
+        if self.accumulation_counter >= self.accumulation_steps:
+            # clip gradient for stability
+            if self.opt.get('clip_grad', True):
+                for key in self.optimizers:
+                    self.scaler.unscale_(self.optimizers[key])
+                for key in self.networks:
+                    torch.nn.utils.clip_grad_norm_(self.networks[key].parameters(), 1.0)
+            
+            # update weights
+            for name in self.optimizers:
+                self.scaler.step(self.optimizers[name])
+                self.optimizers[name].zero_grad(set_to_none=True)
+            
+            # Update scaler for next iteration
+            self.scaler.update()
+            self.accumulation_counter = 0
 
     def update_model_per_iteration(self):
         """update model per iteration"""
@@ -172,7 +168,7 @@ class BaseModel:
             update (bool): update best metric and best model. Default True
         """
         # Always disable autocast for validation
-        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+        with disable_amp():
             self.eval()
     
         # save results
