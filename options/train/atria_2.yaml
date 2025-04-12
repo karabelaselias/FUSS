@@ -1,0 +1,134 @@
+# general setting
+name: fuss_atria_test
+backend: dp # DataParallel
+type: FussModel
+num_gpu: 1
+device: 0
+manual_seed: 42
+visualize: False
+
+pose_timestep: 0
+pose_milestones:
+  2: 2
+  4: 4
+  6: 6
+
+# path
+path:
+  resume_state: ~
+
+use_amp: True
+
+# datasets
+datasets:
+  train_dataset:
+    name: Train
+    type: PairAtriaDataset
+    data_root: /home/karabele/data/atria_data_elena/surfaces
+    phase: train
+    return_evecs: True
+    return_faces: True
+    num_evecs: 40
+    start_index: 0
+    end_index: 60
+  test_dataset:
+    name: Test
+    type: PairAtriaDataset
+    data_root: /home/karabele/data/atria_data_elena/surfaces
+    phase: test
+    return_evecs: True
+    return_faces: True
+    num_evecs: 40
+    start_index: 60
+    end_index: 70
+  # setting for train dataset
+  batch_size: 1
+  num_worker: 4
+
+# network setting
+networks:
+  feature_extractor:
+    type: DiffusionNet
+    in_channels: 128
+    out_channels: 128
+    cache_dir: /home/karabele/data/atria_data_elena/surfaces/diffusion
+    input_type: wks
+  fmap_net:
+    type: RegularizedFMNetOptimized
+    bidirectional: true
+  sparse_permutation:
+    type: SparseSimilarity
+    tau: 0.07                # Temperature parameter for softmax
+    k_neighbors: 5         # Number of neighbors to keep (15-25 is a good range)
+    chunk_size: 4096
+    streams: 1
+    use_half: True
+    hard: False             # Use soft assignment by default
+  interpolator:
+    type: ResnetECPos
+    c_dim: 3
+    dim: 7
+    hidden_dim: 32
+
+# training setting
+train:
+  total_epochs: 15
+  optims:
+    feature_extractor:
+      type: AdamW
+      lr: 1.0e-3
+      fused: True
+    interpolator:
+      type: AdamW
+      lr: 1.0e-3
+      fused: True
+  schedulers:
+    feature_extractor:
+      type: CosineAnnealingLR
+      eta_min: 1.0e-4
+      T_max: 10
+    interpolator:
+      type: CosineAnnealingLR
+      eta_min: 1.0e-4
+      T_max: 10
+  losses:
+    surfmnet_loss:
+      type: SURFMNetLoss
+      w_bij: 1.0
+      w_orth: 1.0
+      w_lap: 0.0
+    couple_loss:
+      type: SquaredFrobeniusLoss
+      loss_weight: 1.0
+    align_loss:
+      type: SquaredFrobeniusLoss
+      loss_weight: 10.0
+    symmetry_loss:
+      type: SquaredFrobeniusLoss
+      loss_weight: 1.0
+    smoothness_loss:
+      type: DirichletLoss
+      loss_weight: 2.0
+    dirichlet_shape_loss:
+      type: DirichletLoss
+      loss_weight: 1.0e+2
+    chamfer_shape_loss:
+      type: ChamferLoss
+      loss_weight: 1.0e+4
+    edge_shape_loss:
+      type: EdgeLoss
+      loss_weight: 1.0e+5
+
+# validation setting
+val:
+  val_freq: 4000
+  metrics:
+    specificity:
+      type: calculate_specificity
+    generalization:
+      type: calculate_generalization
+
+# log setting
+logger:
+  print_freq: 50
+  save_checkpoint_freq: 5000
