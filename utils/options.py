@@ -57,6 +57,16 @@ def parse(opt_path, root_path, is_train=True):
     if opt['num_gpu'] == 'auto':
         opt['num_gpu'] = torch.cuda.device_count()
 
+    # Handle custom output path if provided
+    output_root = opt.get('output_root', None)
+    if output_root is None:
+        output_root = root_path
+    else:
+        # Expand user directory if needed (e.g., ~/experiments)
+        output_root = osp.expanduser(output_root)
+        # Create directory if it doesn't exist
+        os.makedirs(output_root, exist_ok=True)
+    
     # paths
     for key, val in opt['path'].items():
         if (val is not None) and ('resume_state' in key or 'pretrain_network' in key):
