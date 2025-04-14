@@ -73,6 +73,7 @@ def build_dataset(dataset_opt):
     Return:
         dataset (torch.utils.data.Dataset): dataset built by opt.
     """
+    print(dataset_opt)
     dataset_opt = deepcopy(dataset_opt)
     type = dataset_opt.pop('type')
     dataset_name = dataset_opt.pop('name')
@@ -140,14 +141,42 @@ def build_dataloader(dataset, dataset_opt, phase, num_gpu=1, dist=False, sampler
 
 def collate_shape_batch(batch):
     """Collate batch of shape data efficiently"""
-    collated = {}
     
-    # Process each top-level key only once
-    for top_key in batch[0].keys():
-        collated[top_key] = {}
-        inner_keys = batch[0][top_key].keys()
+    # Check if the batch contains items from a SingleShapeDataset or PairShapeDataset
+    first_item = batch[0]
+    if all(isinstance(first_item.get(key), dict) for key in first_item.keys()):
+        # It's a PairShapeDataset (or similar nested structure)
+        collated = {}
         
-        # Group keys by type to avoid repeated prefix checks
+        # Process each top-level key only once
+        for top_key in first_item.keys():
+            collated[top_key] = {}
+            inner_keys = first_item[top_key].keys()
+            
+            # Group keys by type to avoid repeated prefix checks
+            sparse_keys = [k for k in inner_keys if k.startswith('L') or k.startswith('G')]
+            index_keys = [k for k in inner_keys if k.startswith('index') or k.startswith('face_')]
+            name_keys = [k for k in inner_keys if k.startswith('name')]
+            dense_keys = [k for k in inner_keys if k not in sparse_keys + index_keys + name_keys]
+            
+            # Process each key type efficiently
+            for k in sparse_keys:
+                collated[top_key][k] = [b[top_key][k] for b in batch]
+                
+            for k in index_keys:
+                collated[top_key][k] = torch.tensor([b[top_key][k] for b in batch])
+                
+            for k in name_keys:
+                collated[top_key][k] = [b[top_key][k] for b in batch]
+                
+            for k in dense_keys:
+                collated[top_key][k] = torch.stack([b[top_key][k] for b in batch])
+    else:
+        # It's a SingleShapeDataset (flat dictionary structure)
+        collated = {}
+        inner_keys = first_item.keys()
+        
+        # Group keys by type
         sparse_keys = [k for k in inner_keys if k.startswith('L') or k.startswith('G')]
         index_keys = [k for k in inner_keys if k.startswith('index') or k.startswith('face_')]
         name_keys = [k for k in inner_keys if k.startswith('name')]
@@ -155,18 +184,48 @@ def collate_shape_batch(batch):
         
         # Process each key type efficiently
         for k in sparse_keys:
-            collated[top_key][k] = [b[top_key][k] for b in batch]
+            collated[k] = [b[k] for b in batch]
             
         for k in index_keys:
-            collated[top_key][k] = torch.tensor([b[top_key][k] for b in batch])
+            collated[k] = torch.tensor([b[k] for b in batch])
             
         for k in name_keys:
-            collated[top_key][k] = [b[top_key][k] for b in batch]
+            collated[k] = [b[k] for b in batch]
             
         for k in dense_keys:
-            collated[top_key][k] = torch.stack([b[top_key][k] for b in batch])
+            collated[k] = torch.stack([b[k] for b in batch])
     
     return collated
+
+#def collate_shape_batch(batch):
+#    """Collate batch of shape data efficiently"""
+#    collated = {}
+#    print(batch[0])
+#    # Process each top-level key only once
+#    for top_key in batch[0].keys():
+#        collated[top_key] = {}
+#        inner_keys = batch[0][top_key].keys()
+#        
+#        # Group keys by type to avoid repeated prefix checks
+#        sparse_keys = [k for k in inner_keys if k.startswith('L') or k.startswith('G')]
+#        index_keys = [k for k in inner_keys if k.startswith('index') or k.startswith('face_')]
+#        name_keys = [k for k in inner_keys if k.startswith('name')]
+#        dense_keys = [k for k in inner_keys if k not in sparse_keys + index_keys + name_keys]
+#        
+        # Process each key type efficiently
+#        for k in sparse_keys:
+#            collated[top_key][k] = [b[top_key][k] for b in batch]
+#            
+#        for k in index_keys:
+#            collated[top_key][k] = torch.tensor([b[top_key][k] for b in batch])
+#            
+#        for k in name_keys:
+#            collated[top_key][k] = [b[top_key][k] for b in batch]
+#            
+#        for k in dense_keys:
+#            collated[top_key][k] = torch.stack([b[top_key][k] for b in batch])
+#    
+#    return collated
 
 def collate_shape_batch_old(batch):
     """Collate batch of shape data

@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from utils.geometry_util import get_all_operators, to_basis, from_basis, compute_hks_autoscale, compute_wks_autoscale
 from utils.registry import NETWORK_REGISTRY
-from utils.torch_sparse_mm import sparse_mm
+from utils.torch_sparse_mm import torch_sparse_mm
 
 def get_activation(activation_str: str) -> nn.Module:
     """
@@ -173,8 +173,8 @@ class MiniMLP(nn.Module):
                 self.layers.append(nn.Dropout(p=0.5))
 
              # Always add normalization for stability with non-ReLU
-            #if i > 0:  # Skip first layer
-            #    self.layers.append(nn.LayerNorm(layer_sizes[i]))
+            if i > 0:  # Skip first layer
+                self.layers.append(nn.LayerNorm(layer_sizes[i]))
             
             # Add linear layer
             self.layers.append(
@@ -260,8 +260,8 @@ class DiffusionNetBlock(nn.Module):
             feat_grads = []
             for b in range(B):
                 # gradient after diffusion
-                feat_gradX = sparse_mm(gradX[b], feat_diffuse[b])
-                feat_gradY = sparse_mm(gradY[b], feat_diffuse[b])
+                feat_gradX = gradX[b].matmul(feat_diffuse[b]) #torch_sparse_mm(gradX[b], feat_diffuse[b])
+                feat_gradY = gradY[b].matmul(feat_diffuse[b]) #torch_sparse_mm(gradY[b], feat_diffuse[b])
                 feat_grads.append(torch.stack((feat_gradX, feat_gradY), dim=-1))
             feat_grad = torch.stack(feat_grads, dim=0) # [B, V, C, 2]
 
@@ -390,7 +390,7 @@ class DiffusionNet(nn.Module):
         evecs = data.get('evecs', None)
         gradX = data.get('GX', None)
         gradY = data.get('GY', None)
-
+        
         # get descriptors
         hks = data.get('hks', None)
         wks = data.get('wks', None)

@@ -132,12 +132,21 @@ def train_pipeline(root_path):
                 #    with_stack=True
                 #) as prof:
                 model.feed_data(train_data)
-                #print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-                #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
-                #print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=20))
+                #print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+                #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+                #print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
                 
                 backward_timer.start()
+                #with torch.profiler.profile(
+                #    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                #    record_shapes=True,
+                #    profile_memory=True,
+                #    with_stack=True
+                #) as prof:
                 model.optimize_parameters()
+                #print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+                #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+                #print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
                 backward_timer.record()
                 model.update_model_per_iteration()
             

@@ -1,5 +1,94 @@
 import torch
+import torch_sparse
 from typing import Tuple, Optional
+
+
+def torch_sparse_mm(A, B):
+    """
+    Memory-efficient sparse matrix multiplication using torch_sparse.spmm directly.
+    
+    Args:
+        A: PyTorch sparse tensor (COO or CSR) or torch_sparse SparseTensor
+        B: Dense matrix
+        
+    Returns:
+        Result of A @ B
+    """
+    # Handle non-sparse inputs
+    if not hasattr(A, 'is_sparse') and not hasattr(A, 'storage'):
+        return torch.matmul(A, B)
+    
+    # If A is a torch_sparse SparseTensor with 'storage' attribute
+    if hasattr(A, 'storage'):
+        # Direct matmul for SparseTensor
+        return A.matmul(B)
+    
+    # Convert PyTorch sparse format to torch_sparse format
+    if A.layout == torch.sparse_coo:
+        index = A._indices()
+        value = A._values()
+        
+        if A.dim() == 2:
+            # Standard 2D case
+            return torch_sparse.spmm(index, value, A.size(0), A.size(1), B)
+        else:
+            # Batched case - handle each batch separately
+            results = []
+            batch_size = A.size(0)
+            
+            for i in range(batch_size):
+                # Extract indices for this batch
+                batch_mask = index[0] == i
+                batch_index = index[1:, batch_mask]  # Remove batch dimension
+                batch_value = value[batch_mask]
+                
+                # Use torch_sparse.spmm
+                results.append(torch_sparse.spmm(
+                    batch_index, batch_value, 
+                    A.size(1), A.size(2), B[i]
+                ))
+            
+            return torch.stack(results)
+            
+    elif A.layout == torch.sparse_csr:
+        # Convert CSR to COO format for torch_sparse
+        if A.dim() == 2:
+            # Get CSR components
+            crow_indices = A.crow_indices()
+            col_indices = A.col_indices()
+            values = A.values()
+            
+            # Convert to COO
+            row = torch.arange(A.size(0), device=A.device).repeat_interleave(
+                crow_indices[1:] - crow_indices[:-1])
+            index = torch.stack([row, col_indices])
+            
+            # Use torch_sparse.spmm
+            return torch_sparse.spmm(index, values, A.size(0), A.size(1), B)
+        else:
+            # Handle batched CSR similarly to batched COO
+            results = []
+            for i in range(A.size(0)):
+                single_A = A[i]
+                
+                # Convert single CSR to COO
+                crow_indices = single_A.crow_indices()
+                col_indices = single_A.col_indices()
+                values = single_A.values()
+                
+                row = torch.arange(single_A.size(0), device=A.device).repeat_interleave(
+                    crow_indices[1:] - crow_indices[:-1])
+                index = torch.stack([row, col_indices])
+                
+                # Use torch_sparse.spmm
+                results.append(torch_sparse.spmm(
+                    index, values, single_A.size(0), single_A.size(1), B[i]
+                ))
+            
+            return torch.stack(results)
+    
+    else:
+        raise ValueError(f"Unsupported format: {type(A)}")
 
 # ===== JIT-Optimized Helper Functions =====
 

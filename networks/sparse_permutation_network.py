@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_sparse
 import math
 
 from torch_scatter import scatter_max
+
 from typing import Optional, Dict, Tuple
 from utils.registry import NETWORK_REGISTRY
 
@@ -150,17 +152,30 @@ class SparseSimilarity(nn.Module):
         # Trim excess pre-allocated space
         indices = indices[:, :ptr]
         values = values[:ptr]
- 
+
+        # coalesce with torch_sparse
+        #indices, values = coalesce(indices, values, m=n_x, n=n_y)
+
+        #return (indices, values)
+    
         # Create sparse tensor with 2D layout
         sparse_tensor = torch.sparse_coo_tensor(
             indices, values, (n_x, n_y), device=device
         ).coalesce()
-        
+
         # Apply hard assignment if needed
         if self.hard:
             return self._convert_to_hard_assignment(sparse_tensor)
-        
-        return sparse_tensor.to_sparse_csr()
+
+        indices = sparse_tensor.indices()
+        values = sparse_tensor.values()
+    
+        # Create torch_sparse SparseTensor
+        sparse_tensor = torch_sparse.SparseTensor(
+            row=indices[0], col=indices[1], 
+            value=values, sparse_sizes=(n_x, n_y)
+        )
+        return sparse_tensor
     
     def _forward_multi_stream(self, feat_x, feat_y, indices, values, chunk_size):
         """Process forward pass using multiple CUDA streams for parallelism"""
@@ -240,6 +255,9 @@ class SparseSimilarity(nn.Module):
         
         # Create sparse tensor
         #sparse_tensor = create_csr_directly(indices, values, n_x, n_y, device)
+        #indices, values = coalesce(indices, values, m=n_x, n=n_y)
+        #return (indices, values)
+        
         sparse_tensor = torch.sparse_coo_tensor(
             indices, values, (n_x, n_y), device=device
         ).coalesce()
@@ -248,7 +266,16 @@ class SparseSimilarity(nn.Module):
         if self.hard:
             return self._convert_to_hard_assignment(sparse_tensor)
         
-        return sparse_tensor.to_sparse_csr()
+        indices = sparse_tensor.indices()
+        values = sparse_tensor.values()
+    
+        # Create torch_sparse SparseTensor
+        sparse_tensor = torch_sparse.SparseTensor(
+            row=indices[0], col=indices[1], 
+            value=values, sparse_sizes=(n_x, n_y)
+        )
+        
+        return sparse_tensor
     
     def _optimized_topk(self, similarity):
         """A100-optimized top-k implementation with memory layout optimizations"""
@@ -326,6 +353,9 @@ class SparseSimilarity(nn.Module):
         # Trim excess pre-allocated space
         indices = indices[:, :ptr]
         values = values[:ptr]
+
+        #indices, values = coalesce(indices, values, m=n_x, n=n_y)
+        #return (indices, values)
         
         # Create sparse tensor with 2D layout
         sparse_tensor = torch.sparse_coo_tensor(
@@ -336,7 +366,16 @@ class SparseSimilarity(nn.Module):
         if self.hard:
             return self._convert_to_hard_assignment(sparse_tensor)
         
-        return sparse_tensor.to_sparse_csr()
+        indices = sparse_tensor.indices()
+        values = sparse_tensor.values()
+    
+        # Create torch_sparse SparseTensor
+        sparse_tensor = torch_sparse.SparseTensor(
+            row=indices[0], col=indices[1], 
+            value=values, sparse_sizes=(n_x, n_y)
+        )
+        
+        return sparse_tensor
     
     def _convert_to_hard_assignment(self, sparse_tensor):
         """A100-optimized hard assignment conversion with better gradient flow"""
@@ -381,5 +420,14 @@ class SparseSimilarity(nn.Module):
             (n_x, n_y),
             device=device
         ).coalesce()
+
+        indices = result.indices()
+        values = result.values()
+    
+        # Create torch_sparse SparseTensor
+        result = torch_sparse.SparseTensor(
+            row=indices[0], col=indices[1], 
+            value=values, sparse_sizes=(n_x, n_y)
+        )
         
-        return result.to_sparse_csr()
+        return result

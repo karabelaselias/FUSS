@@ -13,7 +13,9 @@ class WassersteinLoss(nn.Module):
         self.loss = SamplesLoss("sinkhorn", p=p, blur=blur, reach=reach)
 
     def forward(self, x, y):
-        x = x.contiguous()
-        y = y.contiguous()
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if not y.is_contiguous():
+            y = y.contiguous()
         loss = self.loss(x, y)
         return self.loss_weight * loss

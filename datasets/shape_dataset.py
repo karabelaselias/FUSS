@@ -13,6 +13,8 @@ from utils.geometry_util import get_operators, compute_hks, compute_wks, torch2n
 from utils.registry import DATASET_REGISTRY
 from itertools import permutations
 
+import torch_sparse
+
 def sort_list(l):
     try:
         return list(sorted(l, key=lambda x: int(re.search(r'\d+(?=\.)', x).group())))
@@ -29,9 +31,9 @@ def get_spectral_ops(item, num_evecs, cache_dir=None):
     item['evecs_trans'] = evecs_trans[:num_evecs]
     item['evals'] =  evals[:num_evecs]
     item['mass'] = mass
-    item['L'] = L
-    item['GX'] = gradX
-    item['GY'] = gradY
+    item['L'] = torch_sparse.SparseTensor.from_torch_sparse_coo_tensor(L)
+    item['GX'] = torch_sparse.SparseTensor.from_torch_sparse_coo_tensor(gradX)
+    item['GY'] = torch_sparse.SparseTensor.from_torch_sparse_coo_tensor(gradY)
     item['hks'] = torch.from_numpy(compute_hks(torch2np(evecs), torch2np(evals), torch2np(mass), n_descr=16, n_eig=num_evecs)).float().contiguous()
     item['wks'] = torch.from_numpy(compute_wks(torch2np(evecs), torch2np(evals), torch2np(mass), n_descr=128, n_eig=num_evecs)).float().contiguous()
 

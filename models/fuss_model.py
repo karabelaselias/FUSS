@@ -13,9 +13,10 @@ from utils.tensor_util import to_device, to_numpy
 #from networks.permutation_network import apply_sparse_similarity, compute_permutation_matrix_sparse
 #from networks.permutation_network import SparseSimilarity
 from utils.fmap_util import fmap2pointmap_keops
-from utils.torch_sparse_mm import sparse_mm
 from utils.amp_utils import disable_amp
 from utils.memory_utils import profile_memory, memory_efficient_computation
+
+import torch_sparse
 
 import gc
 
@@ -81,8 +82,10 @@ class FussModel(BaseModel):
             vert_y_pred_arr = self.compute_displacement(vert_y, vert_x, face_y, Pyx)  # [n_vert_y, 3, T+1] 
             
             # compute alignment loss
-            vert_y_1 = sparse_mm(Pxy, vert_y_pred_arr[:, :, self.pose_timestep])
-            vert_x_1 = sparse_mm(Pyx, vert_x_pred_arr[:, :, self.pose_timestep])
+            vert_y_1 = Pxy.matmul(vert_y_pred_arr[:, :, self.pose_timestep])
+            #torch_sparse_mm(Pxy, vert_y_pred_arr[:, :, self.pose_timestep])
+            vert_x_1 = Pyx.matmul(vert_x_pred_arr[:, :, self.pose_timestep])
+            #torch_sparse_mm(Pyx, vert_x_pred_arr[:, :, self.pose_timestep])
             self.network_timers['interpolator'].record()
 
             self.network_timers['loss_stuff'].start()
@@ -244,7 +247,7 @@ class FussModel(BaseModel):
         if p2p_xy is not None:
             vert_y_align = vert_y[p2p_xy]
         elif Pxy is not None:
-            vert_y_align = sparse_mm(Pxy, vert_y)
+            vert_y_align = Pxy.matmul(vert_y) #torch_sparse_mm(Pxy, vert_y)
         else:
             raise ValueError("Either Pxy or p2p_xy must be provided")
         
@@ -301,7 +304,7 @@ class FussModel(BaseModel):
         if p2p_xy is not None:
             vert_y_align = vert_y[p2p_xy]
         elif Pxy is not None:
-            vert_y_align = sparse_mm(Pxy, vert_y)
+            vert_y_align = Pxy.matmul(vert_y) #torch_sparse_mm(Pxy, vert_y)
         else:
             raise ValueError("Either Pxy or p2p_xy must be provided")
         
@@ -353,7 +356,7 @@ class FussModel(BaseModel):
         # Handle both dense and sparse matrix formats
         for i in range(self.pose_timestep):
                 # Use sparse matrix multiplication
-                vert_y_aligned = sparse_mm(Pxy, vert_y_pred_arr[:, :, self.pose_timestep - 1 - i])
+                vert_y_aligned = Pxy.matmul(vert_y_pred_arr[:, :, self.pose_timestep - 1 - i]) #torch_sparse_mm(Pxy, vert_y_pred_arr[:, :, self.pose_timestep - 1 - i])
                 shape_x_diff_arr[i] = vert_x_pred_arr[:, :, i] - vert_y_aligned
         
         return shape_x_diff_arr
@@ -370,8 +373,8 @@ class FussModel(BaseModel):
 
         if 'couple_loss' in self.losses:
             # Check if using sparse format
-            evecs_y_pb = sparse_mm(Pxy, evecs_y.squeeze())
-            evecs_x_pb = sparse_mm(Pyx, evecs_x.squeeze())
+            evecs_y_pb = Pxy.matmul(evecs_y.squeeze()) #torch_sparse_mm(Pxy, evecs_y.squeeze())
+            evecs_x_pb = Pyx.matmul(evecs_x.squeeze()) #torch_sparse_mm(Pyx, evecs_x.squeeze())
                         
             Cyx_est, Cxy_est = torch.mm(evecs_trans_x.squeeze(), evecs_y_pb).unsqueeze(0), \
                                torch.mm(evecs_trans_y.squeeze(), evecs_x_pb).unsqueeze(0)
@@ -391,8 +394,8 @@ class FussModel(BaseModel):
         #print(vert_y.shape)
         if 'smoothness_loss' in self.losses:
             #vert_x, vert_y = vert_x.unsqueeze(0), vert_y.unsqueeze(0)
-            vert_y_pb = sparse_mm(Pxy, vert_y)
-            vert_x_pb = sparse_mm(Pyx, vert_x)
+            vert_y_pb = Pxy.matmul(vert_y) #torch_sparse_mm(Pxy, vert_y)
+            vert_x_pb = Pyx.matmul(vert_x) #torch_sparse_mm(Pyx, vert_x)
             #Pxy, Pyx = Pxy.unsqueeze(0), Pyx.unsqueeze(0)
             self.loss_metrics['l_smooth'] = (self.losses['smoothness_loss'](vert_y_pb.unsqueeze(0), Lx) +
                                             self.losses['smoothness_loss'](vert_x_pb.unsqueeze(0), Ly))
@@ -460,8 +463,8 @@ class FussModel(BaseModel):
 
         Pxy_sparse, Pyx_sparse = self.compute_permutation_matrix(feat_x, feat_y, bidirectional=True)
 
-        temp_y = sparse_mm(Pxy_sparse, evecs_y) #apply_sparse_similarity(Pxy, evecs_y)
-        temp_x = sparse_mm(Pyx_sparse, evecs_x) #apply_sparse_similarity(Pyx, evecs_x)
+        temp_y = Pxy_sparse.matmul(evecs_y) #torch_sparse_mm(Pxy_sparse, evecs_y) #apply_sparse_similarity(Pxy, evecs_y)
+        temp_x = Pyx_sparse.matmul(evecs_x) #torch_sparse_mm(Pyx_sparse, evecs_x) #apply_sparse_similarity(Pyx, evecs_x)
         Cxy = evecs_trans_y @ temp_x #(Pyx @ evecs_x)
         Cyx = evecs_trans_x @ temp_y #(Pxy @ evecs_y)
         
@@ -551,23 +554,42 @@ class FussModel(BaseModel):
     def deform_template(self, data):
         data_t, data_x = transfer_batch_to_device(self.template, self.device), transfer_batch_to_device(data, self.device)
         name_t, name_x = data_t['name'], data_x['name'][0]
-
+        
+        # Instead of creating a full copy, create a dict-like view that adds batch dimension on-the-fly
+        class BatchedView:
+            def __init__(self, data):
+                self.data = data       
+            def __getitem__(self, key):
+                val = self.data[key]
+                # Add batch dimension to tensors but not to other objects
+                if isinstance(val, torch_sparse.SparseTensor):
+                    return [val]
+                elif torch.is_tensor(val):
+                    return val.unsqueeze(0)
+                return val
+                
+            def get(self, key, default=None):
+                return self[key] if key in self.data else default
+        
+        # This doesn't copy the data, just creates a view with batched access
+        data_t_batched = BatchedView(data_t)
+        
         # get spectral operators
-        evecs_t = data_t['evecs'].squeeze()
-        evecs_x = data_x['evecs'].squeeze()
-        evecs_trans_t = data_t['evecs_trans'].squeeze()
+        evecs_t = data_t['evecs']
+        evecs_x = data_x['evecs'].squeeze(0)
+        evecs_trans_t = data_t['evecs_trans']
 
         # extract feature
-        feat_t = self.networks['feature_extractor'](data_t['verts'].unsqueeze(0), data_t['faces'].unsqueeze(0))
-        feat_x = self.networks['feature_extractor'](data_x['verts'], data_x['faces'])  # [B, Ny, C]
+        feat_t = self.networks['feature_extractor'](data_t_batched)
+        feat_x = self.networks['feature_extractor'](data_x)
 
         vert_t, vert_x = data_t['verts'], data_x['verts'].squeeze(0)
         face_t, face_x = data_t['faces'], data_x['faces'].squeeze(0)
 
         # Interpolation
         Ptx = self.compute_permutation_matrix(feat_t, feat_x, bidirectional=False)  # [B, Nx, Ny], [B, Ny, Nx]
-        temp_tx = sparse_mm(Ptx, evecs_x.squeeze(0))
-        Cxt = evecs_trans_t @ temp_tx.unsqueeze(0) #(Ptx @ evecs_x)
+        temp_tx = Ptx.matmul(evecs_x) #torch_sparse_mm(Ptx, evecs_x.squeeze(0))
+        Cxt = evecs_trans_t @ temp_tx #(Ptx @ evecs_x)
         # convert functional map to point-to-point map
         
         with disable_amp():

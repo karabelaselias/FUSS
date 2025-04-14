@@ -237,6 +237,7 @@ class BaseModel:
 
         # build ssm using pca
         ssm_model = SSMPCA(deformed_training_shapes)
+        print(ssm_model.variances)
 
         # deformed test shapes
         deformed_testing_shapes = torch.empty(0, n_vertices, 3).to(self.device)
@@ -251,11 +252,10 @@ class BaseModel:
         if "generalization" in self.metrics:
             self.metrics["generalization"](ssm_model, dataloader_test, deformed_testing_shapes, logger,
                                            self.device, self.opt['path']['visualization'], self.template)
-
+        
         if "specificity" in self.metrics:
             self.metrics["specificity"](ssm_model, dataloader_train, logger, self.device,
                                            self.opt['path']['visualization'])
-
         logger.info(f'Building SSM done!')
 
         # train mode
@@ -287,7 +287,7 @@ class BaseModel:
             logger.info(f'Shape with minimum loss: {template_name} with loss value: {min_value}')
 
         self.template = {}
-        template_path = self.opt['datasets']['0_reference_dataset']['data_root'] + f'/off/{template_name}.off'
+        template_path = self.opt['datasets']['0_reference_dataset']['data_root'] + f'/off_scaled/{template_name}.off'
         csv_path = self.opt['datasets']['0_reference_dataset']['data_root'] + f'/mesh_info.csv'
         template_verts, template_faces = read_shape(template_path)
         self.template = self.update_template(self.template, template_name, template_verts, template_faces,
@@ -298,8 +298,8 @@ class BaseModel:
     @torch.no_grad()
     def update_template(self, item, name, verts, faces, num_evecs, csv_path):
         item['name'] = f"template_shape_{name}"
-        item['verts'] = torch.from_numpy(verts).float()
-        item['faces'] = torch.from_numpy(faces).long()
+        item['verts'] = torch.from_numpy(verts).float().contiguous()
+        item['faces'] = torch.from_numpy(faces).long().contiguous()
         item = get_spectral_ops(item, num_evecs=num_evecs)
         mesh_info = pd.read_csv(csv_path)
         current_mesh_info = np.array(mesh_info[mesh_info['file_name'] == name])[0]

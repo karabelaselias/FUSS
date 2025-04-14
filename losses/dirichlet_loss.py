@@ -35,7 +35,7 @@ class DirichletLoss(nn.Module):
             # Take one batch of features: [N, K]
             feats_single = feats[b]
             # Multiply: [N, N] @ [N, K] -> [N, K]
-            prod_single = sparse_mm(L, feats_single)
+            prod_single = L.matmul(feats_single) #sparse_mm(L, feats_single)
             #prod_single = torch.sparse.mm(L, feats_single)
             products.append(prod_single)
     

@@ -1,7 +1,7 @@
 import numpy as np
 import numbers
 import torch
-
+import torch_sparse
 
 def _to_device(x, device):
     if torch.is_tensor(x):
@@ -12,9 +12,12 @@ def transfer_batch_to_device(batch, device):
     """Efficiently transfer a batch to the specified device"""
     device_batch = {}
     for key, value in batch.items():
-        if isinstance(value, list) and len(value) > 0 and torch.is_tensor(value[0]):
+        if isinstance(value, list) and len(value) > 0 and isinstance(value[0], torch_sparse.SparseTensor):
+        #torch.is_tensor(value[0]):
             # Handle list of sparse tensors
-            device_batch[key] = [t.to_sparse_csr().to(device=device) for t in value]
+            device_batch[key] = [t.to(device=device) for t in value]
+        elif isinstance(value, torch_sparse.SparseTensor):
+            device_batch[key] = value.to(device)
         elif torch.is_tensor(value):
             # Handle dense tensors
             device_batch[key] = value.to(device)
