@@ -183,6 +183,7 @@ class FussModel(BaseModel):
         return loss_emd
         
     def compute_chamfer_distance(self, vert_x, vert_y, face_x, face_y):
+        
         # Check and fix NaN/Inf values
         if torch.isnan(vert_x).any() or torch.isinf(vert_x).any():
             logger = get_root_logger()
@@ -208,6 +209,7 @@ class FussModel(BaseModel):
             return torch.tensor(0.0, device=vert_x.device, dtype=vert_x.dtype)
 
         loss_chamfer = self.losses['chamfer_shape_loss'](sample_x, sample_y)
+        #loss_chamfer = self.losses['chamfer_shape_loss'](vert_x, vert_y)
         # Check for NaN loss
         if torch.isnan(loss_chamfer) or torch.isinf(loss_chamfer):
             logger = get_root_logger()
@@ -215,7 +217,7 @@ class FussModel(BaseModel):
             loss_chamfer = torch.tensor(0.0, device=vert_x.device, dtype=vert_x.dtype)
         
         return loss_chamfer
-
+    
     def compute_shape_edge_loss(self, vert_x_pred_arr, vert_y_pred_arr, face_x, face_y):
         if 'edge_shape_loss' in self.losses:
             if 'l_edge' not in self.loss_metrics:

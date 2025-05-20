@@ -1,6 +1,7 @@
 import argparse
 import random
 import yaml
+import os
 from collections import OrderedDict
 from os import path as osp
 
@@ -73,13 +74,13 @@ def parse(opt_path, root_path, is_train=True):
             opt['path'][key] = osp.expanduser(val)
 
     if is_train:  # specify training log paths
-        experiments_root = osp.join(root_path, 'experiments', opt['name'])
+        experiments_root = osp.join(output_root, 'experiments', opt['name'])
         opt['path']['experiments_root'] = experiments_root
         opt['path']['models'] = osp.join(experiments_root, 'models')
         opt['path']['log'] = osp.join(experiments_root, 'log')
         opt['path']['visualization'] = osp.join(experiments_root, 'visualization')
     else:  # specify test log paths
-        results_root = osp.join(root_path, 'results', opt['name'])
+        results_root = osp.join(output_root, 'results', opt['name'])
         opt['path']['results_root'] = results_root
         opt['path']['log'] = osp.join(results_root, 'log')
         opt['path']['visualization'] = osp.join(results_root, 'visualization')

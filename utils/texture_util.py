@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import open3d as o3d
+import torch
 
 def write_obj_pair(file_name1, file_name2, verts1, faces1, verts2, faces2, 
                 spectral_map=None, texture_file=None):
